@@ -134,23 +134,27 @@ def edge_attr_build(
     base = bond_features(bond, is_poly_edge=is_poly)  # длина = BOND_BASE_DIM
     ext  = [float(is_khop), float(khop_norm), float(is_rot), float(is_bb_pair), float(is_bb_bond)]
     v = base + ext
-    # Страховка от несовпадений — пад/обрезка, чтобы НИКОГДА не падать на cat():
-    if len(v) < EDGE_FEAT_DIM:
-        v += [0.0] * (EDGE_FEAT_DIM - len(v))
-    elif len(v) > EDGE_FEAT_DIM:
-        v = v[:EDGE_FEAT_DIM]
+    # Страховка от несовпадений — пад/обрезка, чтобы НИКОГДА не падать на cat().
+    # EDGE_FEAT_DIM может быть ещё не определён (до инференса размера), поэтому
+    # берём значение из globals с безопасным дефолтом.
+    target_dim = globals().get("EDGE_FEAT_DIM", BOND_BASE_DIM + EXTRA_EDGE_FEATS + 1)
+    if len(v) < target_dim:
+        v += [0.0] * (target_dim - len(v))
+    elif len(v) > target_dim:
+        v = v[:target_dim]
     return v
 
 def ensure_edge_attr_dim_tensor(ea: torch.Tensor) -> torch.Tensor:
     """Гарантирует shape [E, EDGE_FEAT_DIM] (пад/обрезка, если надо)."""
     if ea.numel() == 0:
         return ea
-    if ea.size(1) == EDGE_FEAT_DIM:
+    target_dim = globals().get("EDGE_FEAT_DIM", BOND_BASE_DIM + EXTRA_EDGE_FEATS + 1)
+    if ea.size(1) == target_dim:
         return ea
-    if ea.size(1) < EDGE_FEAT_DIM:
-        pad = torch.zeros((ea.size(0), EDGE_FEAT_DIM - ea.size(1)), dtype=ea.dtype, device=ea.device)
+    if ea.size(1) < target_dim:
+        pad = torch.zeros((ea.size(0), target_dim - ea.size(1)), dtype=ea.dtype, device=ea.device)
         return torch.cat([ea, pad], dim=1)
-    return ea[:, :EDGE_FEAT_DIM]
+    return ea[:, :target_dim]
 
 # =============================
 # Utils
@@ -1225,7 +1229,8 @@ def bond_features(bond: Optional[rdchem.Bond], is_poly_edge: bool = False):
 BOND_BASE_DIM = len(bond_features(None, True))
 
 # Полная длина edge_attr: base + EXTRA_EDGE_FEATS ([is_khop, khop_norm, is_rot, is_on_bb_pair]) + is_bb_bond
-EDGE_FEAT_DIM = BOND_BASE_DIM + EXTRA_EDGE_FEATS + 1
+# Фактическое значение EDGE_FEAT_DIM вычисляется позже, после определения
+# smiles_to_graph и вызова _infer_feat_dims().
 
 # Удобные индексы (чтобы не резать «на глаз» внутри моделей):
 IDX_IS_POLY     = BOND_BASE_DIM - 1
@@ -1280,9 +1285,6 @@ def _infer_feat_dims() -> Tuple[int, int]:
         return node_dim, edge_dim
     except Exception:
         return 54 + EXTRA_NODE_FEATS, len(bond_features(None, True)) + EXTRA_EDGE_FEATS + 1
-
-
-NODE_FEAT_DIM, EDGE_FEAT_DIM = _infer_feat_dims()
 
 def _connected_components_without_stars(mol, keep_mask):
     # строим списки смежности только по не-звёздам
@@ -1603,6 +1605,8 @@ def smiles_to_graph(smiles: str, poly_edge_mode: Optional[str] = None):
 
     return x, edge_index, edge_attr, gdesc
 
+
+NODE_FEAT_DIM, EDGE_FEAT_DIM = _infer_feat_dims()
 
 def compute_scaffold(smiles: str) -> str:
     m = safe_mol_from_smiles(smiles)
