@@ -1,0 +1,8 @@
+seed_base: 42
+n_seeds: 1
+epochs: 80
+train_batch_size: 64
+lr: 0.002
+data_dir: polymer_comp
+external_dir: external_dir
+out_dir: runs

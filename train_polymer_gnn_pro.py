@@ -10,6 +10,9 @@ import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
+
+import yaml
 
 from rdkit import Chem
 from rdkit.Chem import rdchem, Descriptors, Crippen, rdMolDescriptors, rdMolDescriptors as rdMD, rdmolops
@@ -527,9 +530,13 @@ def blend_submissions(csv_paths: List[str], out_path: str):
 
 
 def set_seed(seed: int):
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def one_hot(x, choices):
     v = [0]*len(choices)
@@ -3364,6 +3371,9 @@ def train_supervised(args):
     split_id = make_split_id(args)
     run_tag = make_run_tag(args)
 
+    writer = SummaryWriter(log_dir=os.path.join(args.out_dir, "tb", run_tag))
+    writer.add_text("hyperparameters", json.dumps(vars(args), ensure_ascii=False, indent=2))
+
     modes = get_poly_modes(args)
     eval_mode = canonical_poly_mode(args, modes)
 
@@ -3924,6 +3934,14 @@ def train_supervised(args):
                   f"val per-target {np.round(np.array(per_t_avg), 4)} | "
                   f"{history[-1]['sec']:.1f}s")
 
+            writer.add_scalar("train/loss_unc", train_loss, ep)
+            writer.add_scalar("train/wMAE", train_wmae, ep)
+            writer.add_scalar("val/wMAE", val_loss, ep)
+            for i, t in enumerate(TARGETS):
+                writer.add_scalar(f"val/{t}", per_t_avg[i], ep)
+            for name, param in model.named_parameters():
+                writer.add_histogram(f"weights/{name}", param.detach().cpu(), ep)
+
             # --- выбор «лучшей» модели по настроенному критерию
             candidate_metric = val_loss  # это EMA-валидация
             candidate_weights = {k: v.detach().cpu() for k, v in ema.shadow.items()}
@@ -4188,6 +4206,15 @@ def train_supervised(args):
 
         except Exception as e:
             print("[SWA] update_bn skipped:", e)
+
+    writer.add_hparams({
+        "lr": args.lr,
+        "batch_size": args.train_batch_size,
+        "epochs": args.epochs
+    }, {
+        "best_val_wMAE": best
+    })
+    writer.close()
 
     return best
 
@@ -4695,6 +4722,9 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
+    p.add_argument("--config", type=str, default=None,
+                   help="Путь к YAML-файлу с гиперпараметрами")
+
     # ---- Paths & IO ---------------------------------------------------------
     g_io = p.add_argument_group("Paths & IO")
     g_io.add_argument("--data_dir", type=str,
@@ -4895,7 +4925,13 @@ def parse_args():
     # ----- parse & postprocess ----------------------------------------------
     args = p.parse_args()
 
-    # if len(args.seed_list) == 1:
+    if args.config:
+        with open(args.config, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        for k, v in cfg.items():
+            if hasattr(args, k):
+                setattr(args, k, v)
+
     args.seed = int(seeds_from_args(args)[0])
 
     # back-compat: общий batch_size прокинуть, если спец. не заданы
@@ -4917,6 +4953,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    set_seed(args.seed)
 
     if platform.system() == "Windows":
         torch.multiprocessing.set_start_method("spawn", force=True)
