@@ -10,14 +10,28 @@ import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+import copy
 
-from rdkit import Chem
-from rdkit.Chem import rdchem, Descriptors, Crippen, rdMolDescriptors, rdMolDescriptors as rdMD, rdmolops
-from rdkit.Chem.Scaffolds import MurckoScaffold
+try:
+    import optuna
+except Exception:
+    optuna = None
 
-from rdkit import RDLogger
-RDLogger.DisableLog('rdApp.warning')   # скрыть предупреждения
-RDLogger.DisableLog('rdApp.error')   # скрыть и ошибки парсинга
+try:
+    from rdkit import Chem
+    from rdkit.Chem import rdchem, Descriptors, Crippen, rdMolDescriptors, rdMolDescriptors as rdMD, rdmolops
+    from rdkit.Chem.Scaffolds import MurckoScaffold
+except Exception as e:
+    Chem = rdchem = Descriptors = Crippen = rdMolDescriptors = rdMD = rdmolops = MurckoScaffold = None
+    RDKit_import_error = e
+
+try:
+    from rdkit import RDLogger
+    RDLogger.DisableLog('rdApp.warning')   # скрыть предупреждения
+    RDLogger.DisableLog('rdApp.error')   # скрыть и ошибки парсинга
+except Exception:
+    RDLogger = None
 
 # progress bars (fallback, если tqdm не установлен)
 try:
@@ -1951,6 +1965,29 @@ def split_main_only_indices(sup_df: pd.DataFrame, val_size: float, seed: int):
 
     return tr_idx, va_idx
 
+
+def split_train_valid_test_indices(sup_df: pd.DataFrame, val_size: float, test_size: float, seed: int):
+    """Split sup_df into train/val/test indices with fixed seed."""
+    if val_size < 0 or test_size < 0 or (val_size + test_size) >= 1.0:
+        raise ValueError("Invalid val/test sizes")
+
+    main_mask = (sup_df["id"] != -1)
+    ext_mask = ~main_mask
+
+    main_df = sup_df[main_mask]
+    ext_df = sup_df[ext_mask]
+
+    idx_all = main_df.index.tolist()
+    # first split off test
+    tr_val_idx, te_idx = train_test_split(idx_all, test_size=test_size, random_state=seed)
+    # then split train/val
+    val_rel = val_size / max(1e-8, (1.0 - test_size))
+    tr_idx, va_idx = train_test_split(tr_val_idx, test_size=val_rel, random_state=seed)
+
+    # add external data to train
+    tr_idx = list(tr_idx) + list(ext_df.index)
+    return list(tr_idx), list(va_idx), list(te_idx)
+
 # =============================
 # Model
 # =============================
@@ -3389,13 +3426,15 @@ def train_supervised(args):
         tr_idx, va_idx = folds[args.fold]
         tr_idx = tr_idx.tolist() if isinstance(tr_idx, np.ndarray) else list(tr_idx)
         va_idx = va_idx.tolist() if isinstance(va_idx, np.ndarray) else list(va_idx)
+        te_idx = []
         print(f"[CV] Using fold {args.fold}/{args.n_folds - 1} | "
               f"train={len(tr_idx)} val={len(va_idx)} (split_seed={args.split_seed})")
     else:
-        tr_idx, va_idx = split_main_only_indices(sup_df, args.val_size, args.split_seed)
+        tr_idx, va_idx, te_idx = split_train_valid_test_indices(sup_df, args.val_size, args.test_size, args.split_seed)
 
     train_ds_by_mode = {m: _slice_tensor_ds(all_items_by_mode[m], tr_idx) for m in modes}
     val_ds_by_mode   = {m: _slice_tensor_ds(all_items_by_mode[m], va_idx) for m in modes}
+    test_ds_by_mode  = {m: _slice_tensor_ds(all_items_by_mode[m], te_idx) for m in modes} if len(te_idx) else {}
 
 
     def make_sup_loaders(bs: int, train_mode: str, val_mode: str):
@@ -3449,6 +3488,19 @@ def train_supervised(args):
         print_loader_info(f"SUP/val[{eval_mode}]", args.train_batch_size, args.train_num_workers,
                           torch.cuda.is_available(), (args.train_num_workers > 0))
 
+
+    if len(te_idx) > 0:
+        bs_test = controller_ft.bs if stages_ft else args.train_batch_size
+        test_loader = DataLoader(
+            test_ds_by_mode[eval_mode],
+            batch_size=bs_test,
+            shuffle=False,
+            collate_fn=collate,
+            worker_init_fn=seed_worker,
+            **make_loader_kwargs(args.train_num_workers)
+        )
+    else:
+        test_loader = None
 
     # ranges, weights = compute_norm_and_weights(tr_df, TARGETS)
     ranges, weights = compute_norm_and_weights(sup_df.iloc[tr_idx], TARGETS)
@@ -3547,6 +3599,14 @@ def train_supervised(args):
 
     def _build_stage_scheduler(opt, steps_in_stage: int, warmup_frac: float, warmup_steps_override: int = 0):
         steps_in_stage = max(1, int(steps_in_stage))
+        if args.lr_scheduler == "cosine":
+            scheduler = CosineAnnealingLR(opt, T_max=steps_in_stage)
+            warm = 0
+            return scheduler, warm, steps_in_stage
+        if args.lr_scheduler == "linear":
+            scheduler = LinearLR(opt, start_factor=1.0, end_factor=0.0, total_iters=steps_in_stage)
+            warm = 0
+            return scheduler, warm, steps_in_stage
         if warmup_steps_override and warmup_steps_override > 0:
             warm = int(warmup_steps_override)
         else:
@@ -4189,6 +4249,24 @@ def train_supervised(args):
         except Exception as e:
             print("[SWA] update_bn skipped:", e)
 
+    if test_loader is not None:
+        try:
+            best_state = torch.load(best_path, map_location=device, weights_only=True)
+            model.load_state_dict(best_state["model"], strict=True)
+        except Exception:
+            pass
+        model.eval()
+        with torch.no_grad():
+            ttot = 0.0; tb = 0
+            for x, ei, ea, bvec, gdesc, y, ymask in test_loader:
+                x, ei, ea, bvec, gdesc, y, ymask = x.to(device), ei.to(device), ea.to(device), bvec.to(device), gdesc.to(device), y.to(device), ymask.to(device)
+                with torch.autocast('cuda', enabled=use_amp, dtype=AMP_DTYPE):
+                    pred = model(x, ei, ea, bvec, gdesc)
+                    tloss, _ = masked_wmae(pred, y, ymask, ranges, weights)
+                ttot += tloss.item(); tb += 1
+            test_wmae = ttot / max(1, tb)
+        print(f"[TEST] wMAE {test_wmae:.4f}")
+
     return best
 
 
@@ -4647,6 +4725,7 @@ def run_many_and_blend(args):
     print(f"[CV] seeds: {seed_list}")
 
     submission_paths = []
+    cv_metrics = []
 
     if args.n_folds >= 2:
         print(f"[CV] {args.n_folds}-fold K-split")
@@ -4658,6 +4737,7 @@ def run_many_and_blend(args):
                 print(f"\n=== Supervised: fold={f} seed={s} ===")
                 best = train_supervised(args)
                 print("Best val wMAE:", best)
+                cv_metrics.append(best)
                 print("=== Inference ===")
                 run_tag = make_run_tag(args)
                 csv_path = run_inference_with_tag(args, run_tag)
@@ -4671,6 +4751,7 @@ def run_many_and_blend(args):
             print(f"\n=== Supervised: seed={s} ===")
             best = train_supervised(args)
             print("Best val wMAE:", best)
+            cv_metrics.append(best)
             print("=== Inference ===")
             run_tag = make_run_tag(args)
             csv_path = run_inference_with_tag(args, run_tag)
@@ -4681,9 +4762,50 @@ def run_many_and_blend(args):
     blend_submissions(submission_paths, blend_out)
     print("[CV] Blended submission:", blend_out)
 
+    if cv_metrics:
+        mean_cv = float(np.mean(cv_metrics))
+        std_cv = float(np.std(cv_metrics))
+        print(f"[CV] Mean val wMAE: {mean_cv:.4f} ± {std_cv:.4f}")
+
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def k_fold_cross_validate(args):
+    if args.n_folds < 2:
+        raise ValueError("n_folds must be >= 2 for cross-validation")
+    metrics = []
+    base_args = copy.deepcopy(args)
+    for f in range(args.n_folds):
+        fold_args = copy.deepcopy(base_args)
+        fold_args.fold = f
+        metric = train_supervised(fold_args)
+        metrics.append(metric)
+    mean_cv = float(np.mean(metrics))
+    std_cv = float(np.std(metrics))
+    print(f"[CV] Mean val wMAE: {mean_cv:.4f} ± {std_cv:.4f}")
+    return mean_cv, std_cv
+
+
+def optuna_tune(args):
+    if optuna is None:
+        raise ImportError("optuna is not installed")
+
+    def objective(trial):
+        trial_args = copy.deepcopy(args)
+        trial_args.hidden = trial.suggest_int("hidden", 64, 512, step=64)
+        trial_args.lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
+        trial_args.lr_scheduler = trial.suggest_categorical("lr_scheduler", ["linear", "cosine", "lambda"])
+        trial_args.n_folds = max(2, trial_args.n_folds or 3)
+        mean_cv, _ = k_fold_cross_validate(trial_args)
+        return mean_cv
+
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=args.optuna_trials)
+    print("[OPTUNA] Best value:", study.best_value)
+    print("[OPTUNA] Best params:", study.best_params)
+    return study
 
 
 # =============================
@@ -4728,6 +4850,9 @@ def parse_args():
     g_sup.add_argument("--dropout", type=float, default=0.1, help="Dropout в энкодере/голове")
     g_sup.add_argument("--val_size", type=float, default=0.15,
                        help="Если n_folds=1 — доля валидации при scaffold-split")
+    g_sup.add_argument("--lr_scheduler", type=str, default="lambda",
+                       choices=["lambda", "linear", "cosine"],
+                       help="Тип LR scheduler")
     g_sup.add_argument("--early_stop", type=int, default=0,
                        help="Патенс в эпохах (0 — выключено)")
     g_sup.add_argument("--cpu", action="store_true", help="Принудительно обучать на CPU")
@@ -4829,6 +4954,12 @@ def parse_args():
                       help="База для генерации сидов при n_seeds (seed_base + [0..n_seeds-1]).")
     g_cv.add_argument("--split_seed", type=int, default=12345,
                       help="Сид для построения K-fold сплитов (независим от обучающего сидa).")
+    g_cv.add_argument("--test_size", type=float, default=0.0,
+                      help="Доля тестового набора при single split")
+    g_cv.add_argument("--cv_only", action="store_true",
+                      help="Только k-fold cross-validation и выход")
+    g_cv.add_argument("--optuna_trials", type=int, default=0,
+                      help="Число испытаний Optuna для подбора гиперпараметров")
 
     # небольшая утилита-метка запуска (не трогать руками — генерится автоматически)
     g_cv.add_argument("--run_tag", type=str, default="",
@@ -4918,6 +5049,9 @@ def parse_args():
 def main():
     args = parse_args()
 
+    if Chem is None:
+        raise ImportError(f"RDKit is not installed: {RDKit_import_error}")
+
     if platform.system() == "Windows":
         torch.multiprocessing.set_start_method("spawn", force=True)
 
@@ -4933,6 +5067,14 @@ def main():
     with open(os.path.join(args.out_dir, "args.json"), "w", encoding="utf-8") as f:
         json.dump(vars(args), f, indent=2)
     print_env_banner()
+
+    if args.optuna_trials > 0:
+        optuna_tune(args)
+        return
+
+    if args.cv_only:
+        k_fold_cross_validate(args)
+        return
 
     if args.pretrain_only:
         print("=== Pretraining (SSL) ===")
