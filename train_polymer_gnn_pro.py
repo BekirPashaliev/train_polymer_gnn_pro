@@ -50,6 +50,17 @@ import hashlib  # для хеш-бакинга n-грамм
 
 import torch.nn.functional as F
 
+import platform
+from rdkit import DataStructs
+
+import platform, os
+from joblib import Parallel, delayed, parallel_config
+
+try:
+    from sklearn.isotonic import IsotonicRegression
+    _HAS_SK_ISO = True
+except Exception:
+    _HAS_SK_ISO = False
 
 # =============================
 # Targets / Constants
@@ -155,6 +166,169 @@ def ensure_edge_attr_dim_tensor(ea: torch.Tensor) -> torch.Tensor:
 # =============================
 # Utils
 # =============================
+
+# Небольшой фолбэк: PAV для изотонической регрессии (кусочно-постоянная),
+# а применяем как кусочно-линейную интерполяцию по узлам.
+def _pav_fit(x, y):
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    order = np.argsort(x)
+    x, y = x[order], y[order]
+    w = np.ones_like(y, dtype=np.float64)
+    # блоки
+    yhat = y.copy()
+    n = len(yhat)
+    i = 0
+    while i < n-1:
+        if yhat[i] <= yhat[i+1]:
+            i += 1
+            continue
+        j = i
+        s, ww = yhat[i]*w[i], w[i]
+        while j >= 0 and yhat[j] > yhat[j+1]:
+            s += yhat[j]*w[j]; ww += w[j]
+            val = s/ww
+            yhat[j] = yhat[j+1] = val
+            j -= 1
+        i += 1
+    # сжимаем в узлы
+    knots_x, knots_y = [x[0]], [yhat[0]]
+    for t in range(1, n):
+        if yhat[t] != yhat[t-1]:
+            knots_x.append(x[t]); knots_y.append(yhat[t])
+    if knots_x[-1] != x[-1]:
+        knots_x.append(x[-1]); knots_y.append(yhat[-1])
+    return np.asarray(knots_x, float), np.asarray(knots_y, float)
+
+def _iso_fit_1d(pred, true):
+    if _HAS_SK_ISO:
+        ir = IsotonicRegression(y_min=None, y_max=None, increasing=True, out_of_bounds="clip")
+        ir.fit(pred, true)
+        # Узлы: sklearn хранит как thresholds_/y_thresholds_
+        return np.asarray(ir.X_thresholds_, float), np.asarray(ir.y_thresholds_, float)
+    return _pav_fit(pred, true)
+
+def _iso_apply_1d(x, knots_x, knots_y):
+    # Кусочно-линейная интерполяция по монотонным узлам
+    return np.interp(x, knots_x, knots_y, left=knots_y[0], right=knots_y[-1]).astype(np.float32)
+
+
+def apply_head_constraints(mu: torch.Tensor, target_names=None) -> torch.Tensor:
+    """
+    Возвращает преобразованное mu с ограничениями:
+      FFV -> sigmoid ∈ (0,1)
+      Rg  -> softplus > 0
+      Density -> softplus > 0
+    Остальные цели без изменений.
+    """
+    if target_names is None:
+        target_names = TARGETS
+    out = mu
+    # делаем копию только если нужные столбцы есть
+    if "FFV" in target_names:
+        i = target_names.index("FFV")
+        v = torch.sigmoid(out[:, i])
+        out = out.clone()
+        out[:, i] = v
+    if "Rg" in target_names:
+        i = target_names.index("Rg")
+        v = F.softplus(out[:, i])
+        out = out.clone()
+        out[:, i] = v
+    if "Density" in target_names:
+        i = target_names.index("Density")
+        v = F.softplus(out[:, i])
+        out = out.clone()
+        out[:, i] = v
+    return out
+
+def _encode_dataset(model, loader, device, use_amp=True):
+    """Возвращает эмбеддинги (N,H), y (N,T), mask (N,T)."""
+    G, Ys, Ms = [], [], []
+    model.eval(); _enable_mc_dropout(model, False)
+    with torch.no_grad():
+        for x, ei, ea, bvec, gdesc, y, ymask in loader:
+            x, ei, ea, bvec, gdesc = x.to(device), ei.to(device), ea.to(device), bvec.to(device), gdesc.to(device)
+            with torch.autocast('cuda', enabled=use_amp, dtype=AMP_DTYPE):
+                g = model.encode(x, ei, ea, bvec, gdesc, use_gdesc=True, use_poly_hints=True)
+            G.append(g.detach().to(torch.float32).cpu().numpy())
+            Ys.append(y.detach().cpu().numpy()); Ms.append(ymask.detach().cpu().numpy())
+    G = np.vstack(G)
+    Y = np.vstack(Ys) if len(Ys) else None
+    M = np.vstack(Ms) if len(Ms) else None
+    return G, Y, M
+
+def _knn_regress(test_G, train_G, train_Y, train_M, k=32, tau=0.2):
+    """
+    Косинусная близость + softmax(weights/tau); per-target маскирование отсутствующих лейблов.
+    """
+    t0 = time.perf_counter()
+
+    # нормализуем
+    eps = 1e-8
+    test_N = test_G / np.maximum(np.linalg.norm(test_G, axis=1, keepdims=True), eps)
+    train_N = train_G / np.maximum(np.linalg.norm(train_G, axis=1, keepdims=True), eps)
+
+    # инфо о размерах
+    print(f"[KNN] test_G={test_G.shape}, train_G={train_G.shape}, "
+          f"targets={train_Y.shape[1]}, k={k}, tau={tau}")
+
+    # батчим по 4096 чтобы не съесть память
+    B = 4096
+    out = np.zeros((test_G.shape[0], train_Y.shape[1]), dtype=np.float32)
+
+    # прогресс по блокам
+    steps = (test_G.shape[0] + B - 1) // B
+    it = range(0, test_G.shape[0], B)
+    try:
+        it = tqdm(it, total=steps, desc="[KNN] blocks")  # tqdm уже есть в файле
+    except Exception:
+        pass
+
+    for s in it:
+        e = min(s + B, test_G.shape[0])
+        # косинусные сходства (через скалярные произведения нормированных)
+        S = test_N[s:e] @ train_N.T  # [b, Ntrain]
+
+        # для каждого таргета отдельно учитываем маски отсутствующих лейблов
+        # (веса на таких строках = -inf → softmax=0)
+        for t in range(train_Y.shape[1]):
+            m = train_M[:, t].astype(bool)            # [Ntrain]
+            if not m.any():
+                continue
+            sims = S[:, m]                             # [b, Navail]
+            # top-k по доступным лейблам
+            kk = min(k, sims.shape[1])
+            if kk <= 0:
+                continue
+            idx = np.argpartition(-sims, kk-1, axis=1)[:, :kk]  # без полной сортировки
+            rows = np.arange(sims.shape[0])[:, None]
+            top = sims[rows, idx]                     # [b, kk]
+            w = np.exp(top / max(tau, 1e-6))
+            w /= np.maximum(w.sum(axis=1, keepdims=True), 1e-8)
+
+            yk = train_Y[m, t][idx]                   # [b, kk]
+            out[s:e, t] = (w * yk).sum(axis=1)
+
+    dt = time.perf_counter() - t0
+    print(f"[KNN] done in {dt:.2f}s")
+    return out
+
+def _enable_mc_dropout(model: nn.Module, enable: bool = True):
+    """
+    Включает train() только у Dropout-слоёв, оставляя остальное в eval().
+    Удобно для TTA без дергания LayerNorm/BatchNorm.
+    """
+    for m in model.modules():
+        if isinstance(m, nn.Dropout):
+            m.train(enable)
+
+class Tic:
+    def __init__(self, tag): self.tag, self.t0 = tag, time.perf_counter()
+    def done(self, extra=""):
+        dt = time.perf_counter() - self.t0
+        print(f"[UNL-TIMER] {self.tag} {extra} | {dt:,.2f}s")
+
 
 def _add_khop_backbone_edges(adj, keep_mask, backbone_set, old2new, src, dst, eattr,
                              kmin=2, kmax=3):
@@ -1107,6 +1281,29 @@ def _poly_backbone_descriptors(mol, keep_mask, backbone_set):
 #     # # RDKit терпит '*', но валентности могут ломаться → заменим на углерод
 #     # s = s.replace("*", "C")
 #     return s
+
+def canonical_poly_smiles(smiles: str) -> str:
+    m = safe_mol_from_smiles(smiles)
+    if m is None:
+        return smiles
+    # нормализуем полимер: убираем '*' и добавляем H, чтобы канонизация была стабильной
+    m2 = strip_stars_and_add_hs(m) or m
+    try:
+        return Chem.MolToSmiles(m2, canonical=True)
+    except Exception:
+        return smiles
+
+def smiles_dedup_key(smiles: str, mode: str = "canon") -> str:
+    if mode == "smiles":
+        return smiles
+    if mode == "inchi":
+        try:
+            return Chem.MolToInchiKey(strip_stars_and_add_hs(safe_mol_from_smiles(smiles)))
+        except Exception:
+            return smiles
+    # default: canonical
+    return canonical_poly_smiles(smiles)
+
 
 def safe_mol_from_smiles(smiles: str):
     try:
@@ -2068,7 +2265,8 @@ class EMA:
                     v.copy_(self.shadow[k])
 
 class PolymerGNN(nn.Module):
-    def __init__(self, node_in_dim, edge_in_dim, gdesc_dim, hidden=256, layers=8, targets=5, dropout=0.1, use_global_token=True):
+    def __init__(self, node_in_dim, edge_in_dim, gdesc_dim, hidden=256, layers=8, targets=5, dropout=0.1, use_global_token=True, predict_sigma=False, constrain=False, per_target_last=False):
+
         super().__init__()
         self.extra_node_feats = EXTRA_NODE_FEATS  # важно знать, где искать флаги
         self.node_embed = nn.Sequential(
@@ -2096,6 +2294,31 @@ class PolymerGNN(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden//2, targets)
         )
+
+        h2 = hidden//2
+        self.head_core = nn.Sequential(
+            nn.LayerNorm(hidden),
+            nn.Linear(hidden, h2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        self.per_target_last = bool(per_target_last)
+        if self.per_target_last:
+            self.head_out_list = nn.ModuleList([nn.Linear(h2, 1) for _ in range(targets)])
+        else:
+            self.head_out = nn.Linear(h2, targets)
+
+        self.predict_sigma = bool(predict_sigma)
+        if self.predict_sigma:
+            # sigma предсказываем из того же h2
+            self.head_sigma_core = nn.Sequential(nn.LayerNorm(hidden),
+                                                 nn.Linear(hidden, h2),
+                                                 nn.ReLU(),
+                                                 nn.Dropout(dropout))
+            self.head_sigma_out = nn.Linear(h2, targets)
+
+        self.constrain = bool(constrain)
+
         self.rho = nn.Parameter(torch.zeros(targets))
 
     @staticmethod
@@ -2144,9 +2367,22 @@ class PolymerGNN(nn.Module):
     def forward(self, x, edge_index, edge_attr, batch_vec, gdesc):
         # supervised-путь: всё включено
         g = self.encode(x, edge_index, edge_attr, batch_vec, gdesc,
-                                use_gdesc = True, use_poly_hints = True)
-        out = self.head(g)
-        return out
+                        use_gdesc=True, use_poly_hints=True)
+
+        h = self.head_core(g)
+        if self.per_target_last:
+            mu = torch.cat([m(h) for m in self.head_out_list], dim=1)
+        else:
+            mu = self.head_out(h)
+
+        if self.constrain:
+            mu = apply_head_constraints(mu, TARGETS)
+
+        if self.predict_sigma:
+            hs = self.head_sigma_core(g)
+            sig = self.head_sigma_out(hs)
+            return mu, sig
+        return mu
 
 
 # =============================
@@ -2173,8 +2409,50 @@ def compute_norm_and_weights(df: pd.DataFrame, target_cols: List[str]):
     arr = arr / max(arr.sum(), 1e-9)
     return np.array([ranges[c] for c in target_cols], dtype=np.float32), arr
 
+# ===== Kaggle-like validation metric (r_i по предсказаниям, w_i нормируются к K) =====
+def _kaggle_weights_from_mask(val_mask: np.ndarray, K: int) -> np.ndarray:
+    # val_mask: (N, T) bool
+    n_i = val_mask.sum(axis=0).astype(np.float32)
+    n_i[n_i <= 0] = 1.0
+    w = 1.0 / np.sqrt(n_i)
+    w = (K * w) / max(w.sum(), 1e-9)
+    return w
+
+def kaggle_wmae_from_preds(pred: np.ndarray, true: np.ndarray, mask: np.ndarray, target_cols=TARGETS):
+    """
+    pred/true: (N, T) float32, mask: (N, T) bool
+    r_i = max(pred_i[mask]) - min(pred_i[mask]);  w_i = K * sqrt(1/n_i) / sum_j sqrt(1/n_j)
+    """
+    assert pred.shape == true.shape == mask.shape
+    K = pred.shape[1]
+    # r_i по предсказаниям текущего чекпоинта
+    r = []
+    for t in range(K):
+        m = mask[:, t]
+        if m.sum() == 0:
+            r.append(1.0)
+            continue
+        p = pred[m, t]
+        ri = float(np.nanmax(p) - np.nanmin(p))
+        r.append(ri if ri > 0 else 1.0)
+    r = np.asarray(r, dtype=np.float32)
+    # веса как на Kaggle
+    w = _kaggle_weights_from_mask(mask, K)
+    # MAE по маске, делённый на r_i
+    abs_err = np.abs((pred - true))
+    abs_err[~mask] = 0.0
+    cnt = mask.sum(axis=0).clip(min=1)
+    per_t = abs_err.sum(axis=0) / cnt
+    per_t = per_t / r
+    score = float((per_t * w).sum())
+    return score, per_t.tolist(), r.tolist(), w.tolist()
+
 # === replace your masked losses ===
 def masked_wmae(pred, true, mask, ranges, weights):
+    # если прилетел (mu, sigma) — берём mu
+    if isinstance(pred, (tuple, list)):
+        pred = pred[0]
+
     # работаем ТОЛЬКО по маске с самого начала
     denom = torch.as_tensor(ranges, device=pred.device, dtype=pred.dtype).view(1, -1).clamp_min_(1e-8)
     w = torch.as_tensor(weights, device=pred.device, dtype=pred.dtype).view(1, -1)
@@ -2195,6 +2473,10 @@ def masked_wmae(pred, true, mask, ranges, weights):
     return score, per_t_mae
 
 def masked_wmae_with_uncertainty(pred, true, mask, ranges, weights, rho):
+    # если прилетел (mu, sigma) — берём mu
+    if isinstance(pred, (tuple, list)):
+        pred = pred[0]
+
     # константы без градиента
     denom = torch.as_tensor(ranges, device=pred.device, dtype=pred.dtype).view(1, -1)
     denom = denom.clamp_min(1e-8)
@@ -2219,6 +2501,28 @@ def masked_wmae_with_uncertainty(pred, true, mask, ranges, weights, rho):
     score = (per_t_mae * w.squeeze(0)).sum()
     return score, per_t_mae
 
+
+def masked_wmae_hetero(pred_mu, true, mask, ranges, weights, sigma_pred):
+    """Пер-сэмпловая (гетероскедастическая) версия: σ предсказывается сетью."""
+    denom = torch.as_tensor(ranges, device=pred_mu.device, dtype=pred_mu.dtype).view(1, -1)
+    denom = denom.clamp_min(1e-8)
+    w = torch.as_tensor(weights, device=pred_mu.device, dtype=pred_mu.dtype).view(1, -1)
+
+    diff = torch.where(mask, pred_mu - true, torch.zeros_like(pred_mu))
+    diff = torch.nan_to_num(diff, nan=0.0, posinf=0.0, neginf=0.0)
+
+    sigma = F.softplus(sigma_pred).clamp(1e-3, 100.0)          # σ>0
+    sigma = torch.where(mask, sigma, torch.ones_like(sigma))   # там где нет таргета — нейтрально
+
+    base = (diff.abs() / denom)
+    term = base / sigma + torch.log(sigma)
+    err  = torch.where(mask, term, torch.zeros_like(term))
+
+    per_t_sum   = err.sum(dim=0)
+    per_t_count = mask.sum(dim=0).clamp(min=1)
+    per_t_mae   = per_t_sum / per_t_count
+    score = (per_t_mae * w.squeeze(0)).sum()
+    return score, per_t_mae
 
 # =============================
 # Data Loading / Merging
@@ -2434,6 +2738,7 @@ def _save_scaffold_map(df_map: pd.DataFrame, p_parq: str, p_csv: str):
     except Exception:
         df_map.to_csv(p_csv, index=False)
 
+
 def ensure_scaffold_map_cached(smiles: List[str], out_dir: str) -> pd.DataFrame:
     """
     Возвращает DataFrame с колонками ['SMILES','scaffold'] для ВСЕХ переданных SMILES.
@@ -2446,13 +2751,13 @@ def ensure_scaffold_map_cached(smiles: List[str], out_dir: str) -> pd.DataFrame:
     df_map = _load_scaffold_map(p_parq, p_csv)
     need_compute = []
     if df_map is None:
-        df_map = pd.DataFrame({"SMILES": pd.unique(smiles)})
+        df_map = pd.DataFrame({"SMILES": np.unique(np.asarray(smiles, dtype=object))})
         df_map["scaffold"] = None
         need_compute = df_map["SMILES"].tolist()
     else:
         # удостоверимся, что покрываем все SMILES (на случай изменений датасета)
         known = set(df_map["SMILES"].astype(str).tolist())
-        allu  = list(pd.unique(pd.Series(smiles).astype(str)))
+        allu = list(np.unique(np.asarray(smiles, dtype=str)))
         need_compute = [s for s in allu if s not in known]
         if need_compute:
             df_map = pd.concat([df_map, pd.DataFrame({"SMILES": need_compute, "scaffold": [None]*len(need_compute)})],
@@ -2616,7 +2921,24 @@ def build_supervised_dataframe(main_train: pd.DataFrame,
 
     return sup
 
-def build_unlabeled_dataframe(main_train: pd.DataFrame, main_test: pd.DataFrame, supp_from_zip: Dict[str,pd.DataFrame], args) -> pd.DataFrame:
+def build_unlabeled_dataframe_smart(main_train: pd.DataFrame,
+                                    main_test: pd.DataFrame,
+                                    supp_from_zip: Dict[str,pd.DataFrame],
+                                    args,
+                                    sup_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    tic = Tic("unlabeled_build")
+
+    # 0) echo настроек
+    print(f"[UNL-ARGS] pretrain_samples={getattr(args, 'pretrain_samples', None)} | "
+          f"near_frac={getattr(args, 'unl_near_frac', None)} | "
+          f"far_frac={getattr(args, 'unl_far_frac', None)} | "
+          f"near_tmin={getattr(args, 'unl_near_tanimoto_min', 0.5)} | "
+          f"far_tmax={getattr(args, 'unl_far_tanimoto_max', 0.25)} | "
+          f"max_ref={getattr(args, 'unl_max_ref', None)} | "
+          f"pi1m_cap={getattr(args, 'unl_pi1m_cap', 0)} | "
+          f"dedup_key={getattr(args, 'unl_dedup_key', 'canon')}")
+
+    # Собираем исходный пул
     unl = []
     # dataset2 inside NeurIPS zip if present
     for k, v in supp_from_zip.items():
@@ -2627,24 +2949,236 @@ def build_unlabeled_dataframe(main_train: pd.DataFrame, main_test: pd.DataFrame,
     pi1m_path = os.path.join(args.external_dir, "PI1M.csv")
     if os.path.isfile(pi1m_path):
         try:
-            pi = pd.read_csv(pi1m_path)
-            if "SMILES" in pi.columns:
-                unl.append(pi[["SMILES"]])
+            pi = pd.read_csv(pi1m_path, usecols=["SMILES"])
+            cap = int(getattr(args, "unl_pi1m_cap", 0) or 0)
+            if cap > 0 and len(pi) > cap:
+                # дешёвая первичная очистка перед сэмплом
+                pi = pi[pi["SMILES"].apply(lambda s: isinstance(s, str) and s.count("*") >= 2)]
+                pi = pi.drop_duplicates(subset=["SMILES"])
+                pi = pi.sample(n=cap, random_state=args.seed)
+            unl.append(pi[["SMILES"]])
         except Exception:
             pass
 
     # all main SMILES (train+test)
     unl.append(main_train[["SMILES"]])
-    unl.append(main_test[["SMILES"]])
+    if args.unl_use_main_test:
+        unl.append(main_test[["SMILES"]])
 
-    unl_df = pd.concat(unl, axis=0, ignore_index=True).drop_duplicates(subset=["SMILES"])
 
-    unl_df = unl_df[unl_df["SMILES"].apply(lambda s: isinstance(s, str) and s.count("*") >= 2)].reset_index(drop=True)
+    # (опц.) добавляем ВСЕ SMILES из supervised пула как безлейбловые
+    if args.unl_use_sup_df and (sup_df is not None) and ("SMILES" in sup_df.columns):
+        unl.append(sup_df[["SMILES"]])
 
-    print(
-        f"[DATA][UNL] total={len(unl_df)} | stars>=2={int(unl_df['SMILES'].apply(lambda s: isinstance(s, str) and s.count('*') >= 2).sum())}")
+    print(f"[UNL] raw_concat={sum(len(x) for x in unl)}")
 
-    return unl_df
+    pool = pd.concat(unl, axis=0, ignore_index=True)
+    before = len(pool)
+    # базовая полимер-фильтрация
+    pool = pool[pool["SMILES"].apply(lambda s: isinstance(s, str) and s.count("*") >= 2)].reset_index(drop=True)
+    print(f"[UNL] star>=2: {before} -> {len(pool)}");
+    tic.done("star_filter")
+
+    # сразу после конкатенации pool:
+    before = len(pool)
+    pool = pool.drop_duplicates(subset=["SMILES"]).reset_index(drop=True)
+    print(f"[UNL] raw_dedup: {before} -> {len(pool)}");
+    tic.done("raw_dedup")
+
+    # 2) Дедупликация по выбранному ключу
+    key_mode = getattr(args, "unl_dedup_key", "canon")
+    pool["__key__"] = pool["SMILES"].astype(str).apply(lambda s: smiles_dedup_key(s, key_mode))
+    before = len(pool)
+    pool = pool.drop_duplicates(subset=["__key__"]).drop(columns=["__key__"]).reset_index(drop=True)
+    print(f"[UNL] smart_dedup({key_mode}): {before} -> {len(pool)}");
+    tic.done("smart_dedup")
+
+    # Если итог меньше квоты — возвращаем сразу
+    target_N = int(args.pretrain_samples) if getattr(args, "pretrain_samples", 0) > 0 else len(pool)
+    if (target_N <= 0) or (len(pool) <= target_N):
+        print(f"[UNL-SELECT] pool={len(pool)} <= target={target_N} → use all");
+        tic.done("early_return")
+        return pool[["SMILES"]].copy()
+
+    # 3) Доменные референсы (для near/far)
+    ref_df = None
+    if sup_df is not None:
+        ref_df = sup_df[["SMILES"]].copy()
+        ref_df = ref_df[ref_df["SMILES"].apply(lambda s: isinstance(s, str) and s.count("*") >= 2)]
+        ref_df = ref_df.drop_duplicates(subset=["SMILES"]).reset_index(drop=True)
+    else:
+        # если sup_df нет — используем train+test как минимум
+        ref_df = pd.concat([main_train[["SMILES"]], main_test[["SMILES"]]], axis=0).drop_duplicates().reset_index(drop=True)
+
+    # 3a) Scaffold-сеты (быстрое "near" по совпадению скелета)
+    print(f"[UNL] ref_df={len(ref_df)} (after star>=2 & dedup)")
+    tic2 = Tic("scaffold_maps")
+    ref_scaf = ensure_scaffold_map_cached(ref_df["SMILES"].astype(str).tolist(), args.out_dir)
+    pool_scaf = ensure_scaffold_map_cached(pool["SMILES"].astype(str).tolist(), args.out_dir)
+    tic2.done()
+    print(f"[UNL] unique_ref_scaffolds={ref_scaf['scaffold'].nunique()} | pool_scaffolds={pool_scaf['scaffold'].nunique()}")
+
+
+    ref_scaf_set = set(ref_scaf["scaffold"].tolist())
+    pool = pool.merge(pool_scaf, on="SMILES", how="left")
+    pool["__is_near_scaf__"] = pool["scaffold"].isin(ref_scaf_set)
+    print(f"[UNL] near_by_scaffold={int(pool['__is_near_scaf__'].sum())} / {len(pool)}")
+
+    # tanimoto
+    near_thr = float(getattr(args, "unl_near_tanimoto_min", 0.5))
+    far_thr = float(getattr(args, "unl_far_tanimoto_max", 0.25))
+    if near_thr <= far_thr:
+        print(f"[WARN] near_tmin({near_thr}) <= far_tmax({far_thr}) — границы пересекаются; проверьте параметры.")
+
+    # 3b) Оценка max-Tanimoto до ближайшего ref (ограничим референсы)
+    _fp_cache = {}
+
+    def fp_cached(smiles):
+        v = _fp_cache.get(smiles)
+        if v is not None: return v
+        v = _morgan_fp_from_smiles(smiles, nBits=args.ssl_fp_bits)
+        _fp_cache[smiles] = v
+        return v
+
+    ref_sample = ref_df["SMILES"].sample(
+        n=min(len(ref_df), max(1, int(args.unl_max_ref))), random_state=args.seed
+    ).tolist()
+    ref_fps = [fp_cached(s) for s in ref_sample]
+
+    # фильтрация невалидных отпечатков
+    ref_fps = [fp for fp in ref_fps if fp is not None]
+    if len(ref_fps) < len(ref_sample):
+        print(f"[UNL] filtered_invalid_ref_fps={len(ref_sample) - len(ref_fps)} | kept={len(ref_fps)}")
+
+    need = (~pool["__is_near_scaf__"]).sum()
+    print(f"[UNL] need_tanimoto_for={need} | ref_fps={len(ref_fps)}")
+    tic3 = Tic("tanimoto")
+
+    # для скорости считаем только там, где нужно (кандидаты вне прямого scaffold-матча)
+    pool_fps = pool["SMILES"].astype(str).apply(fp_cached)
+    pool["__max_t__"] = 0.0
+
+    mask_need = ~pool["__is_near_scaf__"]
+    idxs = pool.index[mask_need].tolist()
+
+    def _max_t_for_idx(i):
+        fp = pool_fps[i]
+        if fp is None or not ref_fps:
+            return 0.0
+        # безопасный вызов: на случай редких странностей внутри RDKit
+        try:
+            sims = DataStructs.BulkTanimotoSimilarity(fp, ref_fps)
+            return max(sims) if sims else 0.0
+        except Exception:
+            best = 0.0
+            for r in ref_fps:
+                if r is not None:
+                    s = DataStructs.TanimotoSimilarity(fp, r)
+                    if s > best: best = s
+            return best
+
+    n_jobs = int(getattr(args, "unl_n_jobs", 0))
+    # чтобы не душить CPU внутри процессов (иначе over-subscription)
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+    use_threads = (platform.system() == "Windows")  # на Windows — threads, на *nix — процессы
+
+    if n_jobs and len(idxs) > 1000:
+        if use_threads:
+            # ВНИМАНИЕ: для threading НЕЛЬЗЯ задавать inner_max_num_threads
+            print(f"[UNL][JBL] backend=threading prefer=threads n_jobs={n_jobs} | tasks={len(idxs)}")
+            with parallel_config(backend="threading"):
+                vals = Parallel(
+                    n_jobs=n_jobs,
+                    prefer="threads",
+                    batch_size=512,
+                )(delayed(_max_t_for_idx)(i) for i in idxs)
+        else:
+            print(f"[UNL][JBL] backend=loky prefer=processes n_jobs={n_jobs} | tasks={len(idxs)}")
+            # Для процессов можно и НУЖНО ограничить внутренний трединг, чтобы не было оверсабскрипшена
+            with parallel_config(backend="loky", inner_max_num_threads=1):
+                vals = Parallel(
+                    n_jobs=n_jobs,
+                    prefer="processes",
+                    batch_size=512,
+                )(delayed(_max_t_for_idx)(i) for i in idxs)
+
+        pool.loc[idxs, "__max_t__"] = vals
+    else:
+        pool.loc[idxs, "__max_t__"] = [_max_t_for_idx(i) for i in idxs]
+
+    tic3.done()
+
+    # краткая статистика по max_t
+    if need > 0:
+        q = pool.loc[~pool["__is_near_scaf__"], "__max_t__"].quantile([0.0, 0.5, 0.9, 0.99]).to_dict()
+        print(f"[UNL] __max_t__ quantiles (non-scaffold): {q}")
+
+    # квоты и выбор
+    print(f"[UNL] target={target_N} | near_frac={getattr(args, 'unl_near_frac', 0.6)} "
+          f"| far_frac={getattr(args, 'unl_far_frac', 0.2)} | scaffold_cap={getattr(args, 'unl_scaffold_cap', 0)}")
+
+    # 4) Квоты near/far
+    near_frac = float(getattr(args, "unl_near_frac", 0.6))
+    far_frac  = float(getattr(args, "unl_far_frac", 0.2))
+    near_N = int(round(near_frac * target_N))
+    far_N  = int(round(far_frac  * target_N))
+    rest_N = max(0, target_N - near_N - far_N)
+
+    # near кандидаты: совпавшие по scaffold ИЛИ с высоким max-T (расположим по убыванию)
+    near_candidates = pool[(pool["__is_near_scaf__"]) | (pool["__max_t__"] >= near_thr)].copy()
+
+    # scaffold-баланс (cap)
+    cap = int(getattr(args, "unl_scaffold_cap", 0))
+    if cap > 0 and "scaffold" in near_candidates.columns:
+        near_selected = []
+        for scaf, grp in near_candidates.groupby("scaffold"):
+            k = min(len(grp), cap)
+            if k > 0:
+                grp2 = grp.sort_values(
+                    by=["__is_near_scaf__", "__max_t__"],
+                    ascending=[False, False]
+                ).head(k)
+                near_selected.append(grp2)
+        near_candidates = pd.concat(near_selected, axis=0, ignore_index=True) if near_selected else near_candidates
+
+    # если переизбыток — обрежем по приоритету: сначала scaffold, потом Tanimoto
+    if len(near_candidates) > near_N:
+        near_candidates = near_candidates.sort_values(
+            by=["__is_near_scaf__", "__max_t__"],
+            ascending=[False, False]
+        ).head(near_N)
+
+    # иначе — возможно, доберём ещё «высоким Tanimoto» из оставшегося пула
+    if len(near_candidates) < near_N:
+        rest_pool = pool.drop(index=near_candidates.index)
+        extra = rest_pool.sort_values("__max_t__", ascending=False).head(near_N - len(near_candidates))
+        near_candidates = pd.concat([near_candidates, extra], axis=0)
+
+    # far кандидаты: низкий max-Tanimoto
+    far_pool = pool.drop(index=near_candidates.index)
+    far_candidates = far_pool[far_pool["__max_t__"] <= far_thr]
+    if len(far_candidates) > far_N:
+        far_candidates = far_candidates.sample(n=far_N, random_state=args.seed)
+    # остаток — случайно из оставшегося пула
+    rest_pool = pool.drop(index=pd.concat([near_candidates, far_candidates]).index)
+    if rest_N > 0 and len(rest_pool) > 0:
+        rest_candidates = rest_pool.sample(n=min(rest_N, len(rest_pool)), random_state=args.seed)
+    else:
+        rest_candidates = rest_pool.iloc[0:0]
+
+    rest_candidates = rest_pool.sample(n=min(rest_N, len(rest_pool)), random_state=args.seed) if rest_N > 0 else rest_pool.iloc[0:0]
+
+    out = pd.concat([near_candidates, far_candidates, rest_candidates], axis=0).drop_duplicates(subset=["SMILES"]).reset_index(drop=True)
+    out = out[["SMILES"]]
+
+    print(f"[UNL-SELECT] pool={len(pool)} → near={len(near_candidates)} | "
+          f"far={len(far_candidates)} | rest={len(rest_candidates)} | target={target_N}")
+    print(f"[UNL] unique_scaffolds_selected={pd.concat([near_candidates, far_candidates, rest_candidates])['scaffold'].nunique()}")
+    tic.done("done")
+
+    return out
 
 # =============================
 # Pretraining (GraphCL-style)
@@ -3177,6 +3711,7 @@ def run_ssl_evaluation(enc, val_ds, val_smiles, device, args, out_dir, tag=""):
 
     # ===== 2) fingerprints & scaffolds
     fps = [_morgan_fp_from_smiles(s, nBits=args.ssl_fp_bits) for s in val_smiles]
+
     scaff = [compute_scaffold(s) for s in val_smiles]
 
     # === A. Triplet Acc
@@ -3251,7 +3786,7 @@ def run_ssl_evaluation(enc, val_ds, val_smiles, device, args, out_dir, tag=""):
         next((_pm(f"R@{k}") for k in ks_sorted if k>=10 and f"R@{k}" in per_metric), None),
         _pm("rho"), _pm("uniformity"), _pm("alignment"), _pm("col_ratio"), _pm("triplet_acc"),
     ]
-    print("[SSL-EVAL][SCORE] " + " | ".join([p for p in pieces if p]))
+    print("\n\n[SSL-EVAL][SCORE] " + " | ".join([p for p in pieces if p]) + "\n\n")
 
     # предупреждения по здравому смыслу
     notes = []
@@ -3275,7 +3810,12 @@ def make_model(sample: GraphData, args):
     gdesc_dim = sample.gdesc.numel()
     model = PolymerGNN(node_in, edge_in, gdesc_dim,
                        hidden=args.hidden, layers=args.layers, targets=len(TARGETS),
-                       dropout=args.dropout)
+                       dropout=args.dropout,
+                       predict_sigma=getattr(args, "hetero_sigma_head", False),
+                       constrain=getattr(args, "constrain_head", False),
+                       per_target_last=getattr(args, "per_target_last", False))
+
+
     return model, node_in, edge_in, gdesc_dim
 
 def scaffold_kfold_indices(df: pd.DataFrame, n_folds: int = 5, seed: int = 12345) -> List[Tuple[np.ndarray, np.ndarray]]:
@@ -3397,14 +3937,37 @@ def train_supervised(args):
     train_ds_by_mode = {m: _slice_tensor_ds(all_items_by_mode[m], tr_idx) for m in modes}
     val_ds_by_mode   = {m: _slice_tensor_ds(all_items_by_mode[m], va_idx) for m in modes}
 
-
     def make_sup_loaders(bs: int, train_mode: str, val_mode: str):
         g = torch.Generator();
         g.manual_seed(args.seed)
+        train_ds = train_ds_by_mode[train_mode]
+        sampler = None
+        if getattr(args, 'balanced_sampler', False):
+            # собираем маски наличия таргетов у каждого образца
+            masks = []
+            for it in getattr(train_ds, "items", []):  # (x, ei, ea, gdesc, y, ymask)
+                m = it[5].reshape(-1)
+                masks.append(m.numpy() if isinstance(m, torch.Tensor) else np.asarray(m))
+            if len(masks):
+                M = np.vstack(masks).astype(np.float32)  # (N, T)
+                freq = M.mean(axis=0)  # доля наличия по каждому таргету
+                eps = 1e-6
+                beta = float(getattr(args, "sampler_beta", 0.5))
+                strength = float(getattr(args, "sampler_strength", 1.0))
+                bonus = np.power(np.maximum(freq, eps), -beta)  # ~ (1/freq)^beta
+                bonus = bonus / max(bonus.mean(), eps)  # норм к среднему 1
+                w = 1.0 + strength * (M @ bonus)  # (N,)
+                w = w / max(w.mean(), eps)
+                sampler = torch.utils.data.WeightedRandomSampler(
+                    weights=torch.as_tensor(w, dtype=torch.double),
+                    num_samples=len(train_ds),
+                    replacement=True
+                )
         tr_loader = DataLoader(
-            train_ds_by_mode[train_mode],
+            train_ds,
             batch_size=bs,
-            shuffle=True,
+            shuffle=(sampler is None),
+            sampler=sampler,
             collate_fn=collate,
             generator=g,
             worker_init_fn=seed_worker,
@@ -3520,7 +4083,16 @@ def train_supervised(args):
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
 
-            model.head.apply(_reset_linear)
+            def _apply_reset(m):
+                if hasattr(model, "head_core"): model.head_core.apply(_reset_linear)
+                if hasattr(model, "head_out"):  model.head_out.apply(_reset_linear)
+                if hasattr(model, "head_out_list"):
+                    for lin in model.head_out_list: lin.apply(_reset_linear)
+                if hasattr(model, "head_sigma_core"): model.head_sigma_core.apply(_reset_linear)
+                if hasattr(model, "head_sigma_out"):  model.head_sigma_out.apply(_reset_linear)
+
+            _apply_reset(model)
+
             with torch.no_grad():
                 model.rho.zero_()
 
@@ -3528,13 +4100,71 @@ def train_supervised(args):
             print("Could not load SSL weights:", e)
 
     # Optim / schedulers
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.99))
+    base_lr = args.lr
+    head_lr = args.head_lr if args.head_lr is not None else base_lr
+    head_wd = args.head_weight_decay if args.head_weight_decay is not None else args.weight_decay
+    sigma_lr = args.sigma_head_lr if args.sigma_head_lr is not None else head_lr
+
+    # собираем параметры без дублей
+    def _params_of(m):
+        return list(m.parameters()) if m is not None else []
+    backbone = set(p for p in model.parameters())
+    head_params = []
+    if hasattr(model, "head_core"): head_params += _params_of(model.head_core)
+    if hasattr(model, "head_out"):  head_params += _params_of(model.head_out)
+    if hasattr(model, "head_out_list"):
+        for lin in model.head_out_list: head_params += _params_of(lin)
+    if hasattr(model, "head_sigma_core"): head_params += _params_of(model.head_sigma_core)
+    if hasattr(model, "head_sigma_out"):  head_params += _params_of(model.head_sigma_out)
+    for p in head_params:
+        if p in backbone: backbone.remove(p)
+    # rho — отдельная группа без weight decay
+    if model.rho in backbone: backbone.remove(model.rho)
+
+    # группы
+    param_groups = [
+        {"params": list(backbone), "lr": base_lr, "weight_decay": args.weight_decay, "role": "backbone"},
+    ]
+    # head_core/out — единый LR/WD
+    core_and_shared = []
+    if hasattr(model, "head_core"): core_and_shared += _params_of(model.head_core)
+    if hasattr(model, "head_out"):  core_and_shared += _params_of(model.head_out)
+    if len(core_and_shared):
+        param_groups.append({"params": core_and_shared, "lr": head_lr, "weight_decay": head_wd, "role": "head_core"})
+
+    # per-target last
+    if hasattr(model, "head_out_list"):
+        mults = [float(x) for x in (args.head_lr_mults.split(",") if isinstance(args.head_lr_mults, str) else args.head_lr_mults)]
+        if len(mults) != len(TARGETS):
+            mults = (mults + [1.0]*len(TARGETS))[:len(TARGETS)]
+        for i, lin in enumerate(model.head_out_list):
+            param_groups.append({"params": list(lin.parameters()), "lr": head_lr*mults[i], "weight_decay": head_wd, "role": f"head_t{i}"})
+
+    # sigma-head
+    if hasattr(model, "head_sigma_core") or hasattr(model, "head_sigma_out"):
+        sig_params = _params_of(model.head_sigma_core) + _params_of(model.head_sigma_out)
+        if len(sig_params):
+            param_groups.append({"params": sig_params, "lr": sigma_lr, "weight_decay": head_wd, "role": "head_sigma"})
+
+    # rho
+    param_groups.append({"params": [model.rho], "lr": head_lr, "weight_decay": 0.0, "role": "rho"})
+
+
+    opt = torch.optim.AdamW(param_groups, betas=(0.9, 0.99))
+    # диагностика
+    print(f"[OPT] groups: backbone={len(param_groups[0]['params'])}, head_core/shared={len(core_and_shared)}, "
+          f"per-target={(hasattr(model,'head_out_list') and len(model.head_out_list)) or 0}, sigma_head="
+          f"{(hasattr(model,'head_sigma_out') and model.head_sigma_out.out_features) if hasattr(model,'head_sigma_out') else 0}")
+
 
     # --- Проверка, что голова и rho в оптимизаторе (п.4)
     opt_param_ids = {id(p) for g in opt.param_groups for p in g["params"]}
     def _in_opt(mod):
         return any(id(p) in opt_param_ids for p in getattr(mod, "parameters")())
-    print(f"[CHECK] head in optimizer: {_in_opt(model.head)} | rho in optimizer: {id(model.rho) in opt_param_ids}")
+
+    print(f"[CHECK] head in optimizer: {_in_opt(model.head)} | "
+          f"head_sigma in optimizer: {getattr(model, 'head_sigma', None) is not None and _in_opt(model.head_sigma)} | "
+          f"rho in optimizer: {id(model.rho) in opt_param_ids}")
 
     # === Stage-aware scheduler: warmup_frac применяется ВНУТРИ каждой стадии ===
 
@@ -3545,35 +4175,94 @@ def train_supervised(args):
         # у тебя в планe поле называется max_epochs
         return max(1, int(getattr(st, "max_epochs", default_ep)))
 
-    def _build_stage_scheduler(opt, steps_in_stage: int, warmup_frac: float, warmup_steps_override: int = 0):
+    def _build_stage_scheduler(opt, steps_in_stage: int, warmup_frac: float, warmup_steps_override: int = 0,
+                               bb_frac=None, bb_steps=0, bb_floor=0.0,
+                               head_frac=None, head_steps=0, head_floor=0.0,
+                               dyn_mults=None):
+        """
+        По-групповой LambdaLR:
+          - для групп с role in {backbone} применяются (bb_frac|bb_steps, bb_floor)
+          - для групп с role in {head_* , rho} применяются (head_frac|head_steps, head_floor)
+          - dyn_mults[i] — внешний динамический множитель (для авто-LR per-target)
+        """
         steps_in_stage = max(1, int(steps_in_stage))
-        if warmup_steps_override and warmup_steps_override > 0:
-            warm = int(warmup_steps_override)
-        else:
-            warm = max(1, int(warmup_frac * steps_in_stage))
+        # дефолты
+        if bb_frac is None: bb_frac = warmup_frac
+        if head_frac is None: head_frac = warmup_frac
+        dyn_mults = dyn_mults if dyn_mults is not None else [1.0] * len(opt.param_groups)
 
-        def _lr_lambda(step):
-            # step — локальный шаг внутри стадии (0..steps_in_stage-1)
-            if step < warm:
-                return float(step + 1) / float(warm)
-            # cosine decay 1 -> 0
-            remain = max(1, steps_in_stage - warm)
-            progress = (step - warm) / float(remain)
-            return 0.5 * (1.0 + math.cos(math.pi * progress))
+        def _mk_lambda(warm_frac, steps_override, floor):
+            warm = int(steps_override) if steps_override and steps_override > 0 else max(1,
+                                                                                         int(warm_frac * steps_in_stage))
+            floor = float(max(0.0, min(1.0, floor)))
 
-        scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=_lr_lambda)
-        return scheduler, warm, steps_in_stage
+            def _lam(step):
+                if step < warm:
+                    return float(step + 1) / float(max(1, warm))
+                remain = max(1, steps_in_stage - warm)
+                progress = (step - warm) / float(remain)
+                # косина от 1 к floor
+                return floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+            return _lam, warm
+
+        # под каждую группу — своя лямбда
+        lams = []
+        warms = []
+        for gi, g in enumerate(opt.param_groups):
+            role = str(g.get("role", "backbone"))
+            if role.startswith("head_") or role == "rho":
+                lam, warm = _mk_lambda(head_frac, head_steps, head_floor)
+            else:
+                lam, warm = _mk_lambda(bb_frac, bb_steps, bb_floor)
+            # заворачиваем в мультипликатор
+            lams.append(lambda step, lam=lam, gi=gi: float(dyn_mults[gi]) * lam(step))
+            warms.append(warm)
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lams)
+        # warmup_steps наименьший для логов (не критично)
+        return scheduler, int(np.median(warms)), steps_in_stage
 
     # первичная инициализация шедулера под текущий bs
     steps_per_epoch = len(train_loader)
     est_ep = _estimate_stage_epochs_for_current(controller_ft if stages_ft else None, args.epochs)
     _stage_total_steps = max(1, steps_per_epoch * est_ep)
+
+    # динамические множители lr по группам (для авто-LR per-target)
+    dyn_mults = [1.0] * len(opt.param_groups)
+
     sched, _stage_warmup_steps, _stage_total_steps = _build_stage_scheduler(
         opt,
         steps_in_stage=_stage_total_steps,
         warmup_frac=args.warmup_frac,
-        warmup_steps_override=getattr(args, "warmup_steps", 0)
+        warmup_steps_override=getattr(args, "warmup_steps", 0),
+        bb_frac=(args.bb_warmup_frac if args.bb_warmup_frac is not None else args.warmup_frac),
+        bb_steps=args.bb_warmup_steps, bb_floor=args.bb_cosine_floor,
+        head_frac=(args.head_warmup_frac if args.head_warmup_frac is not None else args.warmup_frac),
+        head_steps=args.head_warmup_steps, head_floor=args.head_cosine_floor,
+        dyn_mults=dyn_mults
     )
+
+    # --- Авто-LR per-target: подготовка
+    head_group_indices = []  # индексы param_groups, соответствующие head_out_list[i]
+    if getattr(model, "per_target_last", False):
+        for gi, g in enumerate(opt.param_groups):
+            r = str(g.get("role", ""))
+            if r.startswith("head_t"):
+                head_group_indices.append(gi)  # порядок совпадает с индексом таргета
+    # буферы норм градиента
+    from collections import deque
+    grad_hist = [deque(maxlen=max(1, int(args.auto_lr_window))) for _ in range(len(head_group_indices))]
+
+    def _module_grad_norm(mod):
+        s = 0.0
+        for p in mod.parameters():
+            if p.grad is not None:
+                v = p.grad.detach()
+                s += float((v * v).sum().item())
+        return math.sqrt(max(s, 0.0))
+
+
     _stage_step = 0  # локальный шаг в текущей стадии
     last_lr = None  # для диагностики
     print(f"[SUP][BATCH-GROWTH] stage scheduler init | steps/ep={steps_per_epoch} "
@@ -3656,14 +4345,22 @@ def train_supervised(args):
                     device), y.to(device), ymask.to(device)
 
                 with torch.autocast('cuda', enabled=use_amp, dtype=AMP_DTYPE):
-                    pred = model(x, ei, ea, bvec, gdesc)
-                    # оптимизируем неопределённостный лосс
-                    loss, _ = masked_wmae_with_uncertainty(pred, y, ymask, ranges, weights, model.rho)
+
+                    out = model(x, ei, ea, bvec, gdesc)
+                    if isinstance(out, tuple):  # hetero head → (mu, sigma)
+                        pred, sig = out
+                        if getattr(args, "hetero_sigma_head", False):
+                            loss, _ = masked_wmae_hetero(pred, y, ymask, ranges, weights, sig)
+                        else:
+                            loss, _ = masked_wmae_with_uncertainty(pred, y, ymask, ranges, weights, model.rho)
+                    else:
+                        pred = out
+                        loss, _ = masked_wmae_with_uncertainty(pred, y, ymask, ranges, weights, model.rho)
 
                     # --- Physics-inspired reg: Density ~ (1 - FFV) ---
                     lam = getattr(args, "physics_reg_lambda", 0.01)
                     if (lam > 0.0) and (not phys_announced):
-                        print(f"[PHYS] Density ≈ (1-FFV) reg enabled | λ={lam}")
+                        # print(f"[PHYS] Density ≈ (1-FFV) reg enabled | λ={lam}")
                         phys_announced = True
 
                     if lam > 0.0 and pred.size(1) >= len(TARGETS):
@@ -3710,6 +4407,17 @@ def train_supervised(args):
                         torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
+                # === Авто-LR per-target: собрать нормы градиента у последнего слоя каждого таргета
+                if args.auto_head_lr_mults and getattr(model, "per_target_last", False) and len(
+                        head_group_indices) == len(TARGETS):
+                    try:
+                        for ti, gi in enumerate(head_group_indices):
+                            lin = model.head_out_list[ti]
+                            gnorm = _module_grad_norm(lin)
+                            grad_hist[ti].append(gnorm)
+                    except Exception:
+                        pass
+
                 if torch.isfinite(grad_norm):
                     scaler.step(opt)
                 else:
@@ -3728,8 +4436,40 @@ def train_supervised(args):
                 else:
                     sched.step()
 
+                # === Авто-LR per-target: периодическое обновление множителей dyn_mults
+                if args.auto_head_lr_mults and getattr(model, "per_target_last", False) and len(
+                        head_group_indices) == len(TARGETS):
+                    do_update = (global_step % max(1, int(args.auto_lr_every)) == 0)
+                    # при желании — стартовать только после warmup текущей стадии
+                    if args.auto_lr_start_after_warmup:
+                        do_update = do_update and (_stage_step > _stage_warmup_steps)
+                    if do_update:
+                        means = np.array([(sum(h) / max(1, len(h))) if len(h) > 0 else 0.0 for h in grad_hist],
+                                         dtype=np.float64)
+                        # опорная величина — медиана по ненулевым
+                        nz = means[means > 0]
+                        if nz.size > 0:
+                            ref = float(np.median(nz))
+                            gamma = float(args.auto_lr_gamma)
+                            lo, hi = float(args.auto_lr_min_mult), float(args.auto_lr_max_mult)
+                            for ti, gi in enumerate(head_group_indices):
+                                gv = float(means[ti])
+                                if gv <= 0:
+                                    mult = 1.0
+                                else:
+                                    mult = (ref / gv) ** gamma
+                                mult = float(max(lo, min(hi, mult)))
+                                dyn_mults[gi] = mult
+                            # для читаемого лога — редко
+                            if (it % max(50, args.auto_lr_every) == 0) or it == batches:
+                                txt = ", ".join([f"{TARGETS[ti]}×{dyn_mults[gi]:.2f}" for ti, gi in
+                                                 enumerate(head_group_indices)])
+                                print(f"[AUTO-LR] step {global_step} | per-target mults: {txt}")
+
                 # локальный шаг текущей стадии
                 _stage_step += 1
+
+
 
                 # --- Warmup/LR лог
                 cur_lr = current_lr(opt)
@@ -3748,7 +4488,7 @@ def train_supervised(args):
                     swa_model.update_parameters(model)
                     swa_updates += 1
 
-                    print(f"[SWA] epoch {ep} updates={swa_updates} last_lr={cur_lr:.2e}")
+                    # print(f"[SWA] epoch {ep} updates={swa_updates} last_lr={cur_lr:.2e}")
 
                 tot += loss.item()
                 nb += 1
@@ -3838,33 +4578,150 @@ def train_supervised(args):
             #     swa_sched.step()
 
 
-            # val with EMA params
+            # # val with EMA params
+            # model.eval()
+            # # store and load EMA weights
+            # ckpt_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            # ema.copy_to(model)
+            # with torch.no_grad():
+            #     vtot = 0.0
+            #     vb = 0
+            #     per_t_sum = torch.zeros(len(TARGETS))
+            #     iterator_val = val_loader
+            #     if not args.no_tqdm:
+            #         iterator_val = tqdm(val_loader, total=len(val_loader), desc=f"[VAL] Epoch {ep:02d}", leave=False)
+            #
+            #     for x, ei, ea, bvec, gdesc, y, ymask in iterator_val:
+            #         x, ei, ea, bvec, gdesc, y, ymask = x.to(device), ei.to(device), ea.to(device), bvec.to(
+            #             device), gdesc.to(device), y.to(device), ymask.to(device)
+            #         with torch.autocast('cuda', enabled=use_amp, dtype=AMP_DTYPE):
+            #             out = model(x, ei, ea, bvec, gdesc)
+            #             pred = out[0] if isinstance(out, tuple) else out
+            #             vloss, per_t = masked_wmae(pred, y, ymask, ranges, weights)
+            #
+            #         vtot += vloss.item()
+            #         vb += 1
+            #         per_t_sum += per_t.cpu()
+            #         if not args.no_tqdm:
+            #             iterator_val.set_postfix(wMAE=f"{(vtot / max(1, vb)):.4f}")
+            #     val_loss = vtot / max(1, vb)
+            #     per_t_avg = (per_t_sum / max(1, vb)).tolist()
+
+
+            # --- собираем предсказания/таргеты для Kaggle-like метрики ---
+            val_pred_agg = None  # будем суммировать по eval-модам, а потом усреднять
+            val_true_all, val_mask_all = None, None
+            val_true_chunks, val_mask_chunks = [], []
+            eval_modes_to_use = []
+            if (args.poly_edge_eval_mode or "first").strip().lower() == "avg":
+                eval_modes_to_use = modes
+            else:
+                eval_modes_to_use = [eval_mode]
+
+            # → валидация на EMA-параметрах
             model.eval()
-            # store and load EMA weights
             ckpt_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             ema.copy_to(model)
+            vtot = 0.0;
+            vb = 0;
+            per_t_sum = torch.zeros(len(TARGETS))
+
             with torch.no_grad():
-                vtot = 0.0
-                vb = 0
-                per_t_sum = torch.zeros(len(TARGETS))
-                iterator_val = val_loader
-                if not args.no_tqdm:
-                    iterator_val = tqdm(val_loader, total=len(val_loader), desc=f"[VAL] Epoch {ep:02d}", leave=False)
+                for m_eval in eval_modes_to_use:
+                    # если текущий loader не из нужного режима — создаём временный
+                    loader = val_loader if m_eval == eval_mode else DataLoader(
+                        val_ds_by_mode[m_eval],
+                        batch_size=controller_ft.bs if stages_ft else args.train_batch_size,
+                        shuffle=False, collate_fn=collate, generator=torch.Generator().manual_seed(args.seed),
+                        worker_init_fn=seed_worker, **make_loader_kwargs(args.train_num_workers)
+                    )
+                    it = loader if args.no_tqdm else tqdm(loader, total=len(loader),
+                                                          desc=f"[VAL:{m_eval}] Epoch {ep:02d}", leave=False)
+                    preds_here = []
+                    collect_truth = (m_eval == eval_modes_to_use[0])  # GT/маски собираем только в первом режиме
 
-                for x, ei, ea, bvec, gdesc, y, ymask in iterator_val:
-                    x, ei, ea, bvec, gdesc, y, ymask = x.to(device), ei.to(device), ea.to(device), bvec.to(
-                        device), gdesc.to(device), y.to(device), ymask.to(device)
-                    with torch.autocast('cuda', enabled=use_amp, dtype=AMP_DTYPE):
-                        pred = model(x, ei, ea, bvec, gdesc)
-                        vloss, per_t = masked_wmae(pred, y, ymask, ranges, weights)
+                    for x, ei, ea, bvec, gdesc, y, ymask in it:
+                        x, ei, ea, bvec, gdesc = x.to(device), ei.to(device), ea.to(device), bvec.to(device), gdesc.to(device)
+                        y, ymask = y.to(device), ymask.to(device)
+                        with torch.autocast('cuda', enabled=use_amp, dtype=AMP_DTYPE):
+                            out = model(x, ei, ea, bvec, gdesc)
+                            pred = out[0] if isinstance(out, tuple) else out
+                            vloss, per_t = masked_wmae(pred, y, ymask, ranges, weights)
+                        vtot += vloss.item(); vb += 1; per_t_sum += per_t.cpu()
+                        preds_here.append(pred.detach().to(torch.float32).cpu().numpy())
+                        if val_true_all is None:
+                            val_true_all = [y.detach().cpu().numpy()]
+                            val_mask_all = [ymask.detach().cpu().numpy()]
+                        else:
+                            # только первые проходы сохраняют y/ymask
+                            pass
+                        if collect_truth:
+                            # накапливаем GT/маски для всех батчей ПЕРВОГО режима
+                            val_true_chunks.append(y.detach().cpu().numpy())
+                            val_mask_chunks.append(ymask.detach().cpu().numpy())
+                    preds_here = np.vstack(preds_here)
+                    val_pred_agg = preds_here if val_pred_agg is None else (val_pred_agg + preds_here)
 
-                    vtot += vloss.item()
-                    vb += 1
-                    per_t_sum += per_t.cpu()
-                    if not args.no_tqdm:
-                        iterator_val.set_postfix(wMAE=f"{(vtot / max(1, vb)):.4f}")
+                # старая внутренняя wMAE (по train ranges/weights) — оставим для мониторинга
                 val_loss = vtot / max(1, vb)
                 per_t_avg = (per_t_sum / max(1, vb)).tolist()
+
+                # Kaggle-like wMAE по усреднённым предсказаниям
+                val_pred_all = (val_pred_agg / float(len(eval_modes_to_use))).astype(np.float32, copy=False)
+                # GT/маски — конкатенация всех батчей первого режима
+                val_true_all = np.vstack(val_true_chunks).astype(np.float32, copy=False)
+                val_mask_all = np.vstack(val_mask_chunks).astype(bool, copy=False)
+                # строгая проверка совпадения форм
+                if not (val_pred_all.shape[0] == val_true_all.shape[0] == val_mask_all.shape[0]):
+                    raise RuntimeError(f"[VAL][BUG] shape mismatch after fix: "
+                                       f"pred={val_pred_all.shape} "
+                                       f"true={val_true_all.shape} "
+                                       f"mask={val_mask_all.shape}")
+                val_wmae_kaggle, per_t_kaggle, r_used, w_used = kaggle_wmae_from_preds(val_pred_all, val_true_all, val_mask_all)
+
+                # ---- Сохраняем OOF и (опц.) обучаем изотоническую калибровку ----
+                oof_pack = {
+                    "targets": TARGETS,
+                    "pred": val_pred_all.astype(np.float32).tolist(),
+                    "true": val_true_all.astype(np.float32).tolist(),
+                    "mask": val_mask_all.astype(bool).tolist(),
+                }
+                oof_path = os.path.join(args.out_dir, f"oof_{run_tag}.json")
+                with open(oof_path, "w") as f:
+                    json.dump(oof_pack, f)
+                # print(f"[VAL] saved OOF → {oof_path}")
+
+                if getattr(args, "fit_isotonic", False):
+                    iso = {}
+                    for i, t in enumerate(TARGETS):
+                        m = val_mask_all[:, i].astype(bool)
+                        if m.sum() < 10:
+                            continue
+                        px = val_pred_all[m, i].astype(np.float64)
+                        py = val_true_all[m, i].astype(np.float64)
+                        kx, ky = _iso_fit_1d(px, py)
+                        iso[t] = {"x": kx.tolist(), "y": ky.tolist()}
+                    iso_path = os.path.join(args.out_dir, f"isotonic_{run_tag}.json")
+                    with open(iso_path, "w") as f:
+                        json.dump({"targets": TARGETS, "maps": iso}, f)
+                    # print(f"[VAL] fitted isotonic calibrators → {iso_path}")
+
+                # ---- Сохраняем вал-статистики предсказаний для пост-обработки ----
+                if getattr(args, "save_val_range_stats", False):
+                    stats = {}
+                    for i, t in enumerate(TARGETS):
+                        m = val_mask_all[:, i].astype(bool)
+                        if m.sum() == 0:
+                            stats[t] = {"q_low": None, "q_high": None, "min": None, "max": None}
+                            continue
+                        v = val_pred_all[m, i]
+                        ql = float(np.percentile(v, args.winsor_q_low)) if 0.0 < args.winsor_q_low < 50.0 else None
+                        qh = float(np.percentile(v, args.winsor_q_high)) if 50.0 < args.winsor_q_high < 100.0 else None
+                        stats[t] = {"q_low": ql, "q_high": qh, "min": float(v.min()), "max": float(v.max())}
+                    stats_path = os.path.join(args.out_dir, f"calib_stats_{run_tag}.json")
+                    with open(stats_path, "w") as f:
+                        json.dump({"targets": TARGETS, "stats": stats}, f, indent=2)
+                    # print(f"[VAL] saved calib stats → {stats_path}")
 
                 sigma = F.softplus(model.rho).detach().cpu().tolist()
                 val_rec = {
@@ -3897,7 +4754,8 @@ def train_supervised(args):
                     for x, ei, ea, bvec, gdesc, y, ymask in iterator_val:
                         x, ei, ea, bvec, gdesc, y, ymask = x.to(device), ei.to(device), ea.to(device), bvec.to(device), gdesc.to(device), y.to(device), ymask.to(device)
                         with torch.autocast('cuda', enabled=use_amp, dtype=AMP_DTYPE):
-                            pred = model(x, ei, ea, bvec, gdesc)
+                            out = model(x, ei, ea, bvec, gdesc)
+                            pred = out[0] if isinstance(out, tuple) else out
                             vloss_swa, per_t_swa = masked_wmae(pred, y, ymask, ranges, weights)
                         vtot_swa += vloss_swa.item()
                         vb_swa += 1
@@ -3913,19 +4771,23 @@ def train_supervised(args):
                 "train_loss_unc": train_loss,  # оптимизационная
                 "train_wMAE": train_wmae,      # интерпретируемая
                 "val_wMAE": val_loss,
+                "val_wMAE_internal": val_loss,
+                "val_wMAE_kaggle": val_wmae_kaggle,
                 "per_target": per_t_avg,
                 "sec": time.time()-t0
             })
 
             # печать с понятными именами
             print(f"Epoch {ep:02d} | train_loss_unc {train_loss:.4f} | train_wMAE {train_wmae:.4f} | "
-                  f"val_wMAE {val_loss:.4f} | "
+                  f"val_wMAE(int) {val_loss:.4f} | val_wMAE(K) {val_wmae_kaggle:.4f} | "
                   f"train per-target {np.round(np.array(train_per_t), 4)} | "
                   f"val per-target {np.round(np.array(per_t_avg), 4)} | "
                   f"{history[-1]['sec']:.1f}s")
 
+
             # --- выбор «лучшей» модели по настроенному критерию
-            candidate_metric = val_loss  # это EMA-валидация
+            # candidate_metric = val_loss  # это EMA-валидация
+            candidate_metric = val_wmae_kaggle  # выбираем чекпоинт по Kaggle-like
             candidate_weights = {k: v.detach().cpu() for k, v in ema.shadow.items()}
             candidate_kind = "ema"
 
@@ -4064,10 +4926,18 @@ def train_supervised(args):
 
         # разморозка/заморозка
         if args.dot_head_only:
-            for p in model.parameters():
-                p.requires_grad = False
-            for p in model.head.parameters():
-                p.requires_grad = True
+            for p in model.parameters(): p.requires_grad = False
+            if hasattr(model, "head_core"):
+                for p in model.head_core.parameters(): p.requires_grad = True
+            if hasattr(model, "head_out"):
+                for p in model.head_out.parameters(): p.requires_grad = True
+            if hasattr(model, "head_out_list"):
+                for lin in model.head_out_list:
+                    for p in lin.parameters(): p.requires_grad = True
+            if hasattr(model, "head_sigma_core"):
+                for p in model.head_sigma_core.parameters(): p.requires_grad = True
+            if hasattr(model, "head_sigma_out"):
+                for p in model.head_sigma_out.parameters(): p.requires_grad = True
             model.rho.requires_grad_(True)
         else:
             for p in model.parameters():
@@ -4096,9 +4966,17 @@ def train_supervised(args):
                 it += 1
                 x, ei, ea, bvec, gdesc, y, ymask = x.to(device), ei.to(device), ea.to(device), bvec.to(device), gdesc.to(device), y.to(device), ymask.to(device)
                 with torch.autocast('cuda', enabled=use_amp, dtype=AMP_DTYPE):
-                    pred = model(x, ei, ea, bvec, gdesc)
-                    # доточкa тем же «uncertainty»-лоссом, чтобы rho было осмысленным
-                    loss_dot, _ = masked_wmae_with_uncertainty(pred, y, ymask, ranges, weights, model.rho)
+                    out = model(x, ei, ea, bvec, gdesc)
+                    if isinstance(out, tuple):  # hetero head → (mu, sigma)
+                        pred, sig = out
+                        if getattr(args, "hetero_sigma_head", False):
+                            # доточкa тем же «uncertainty»-лоссом, чтобы rho было осмысленным
+                            loss_dot, _ = masked_wmae_hetero(pred, y, ymask, ranges, weights, sig)
+                        else:
+                            loss_dot, _ = masked_wmae_with_uncertainty(pred, y, ymask, ranges, weights, model.rho)
+                    else:
+                        pred = out
+                        loss_dot, _ = masked_wmae_with_uncertainty(pred, y, ymask, ranges, weights, model.rho)
 
                 dot_opt.zero_grad(set_to_none=True)
                 scaler.scale(loss_dot).backward()
@@ -4125,7 +5003,8 @@ def train_supervised(args):
                 for x, ei, ea, bvec, gdesc, y, ymask in val_loader:
                     x, ei, ea, bvec, gdesc, y, ymask = x.to(device), ei.to(device), ea.to(device), bvec.to(device), gdesc.to(device), y.to(device), ymask.to(device)
                     with torch.autocast('cuda', enabled=use_amp, dtype=AMP_DTYPE):
-                        pred = model(x, ei, ea, bvec, gdesc)
+                        out = model(x, ei, ea, bvec, gdesc)
+                        pred = out[0] if isinstance(out, tuple) else out
                         vloss, _ = masked_wmae(pred, y, ymask, ranges, weights)
                     vtot += vloss.item(); vb += 1
                 val_dot = vtot / max(1, vb)
@@ -4141,7 +5020,8 @@ def train_supervised(args):
                     for x, ei, ea, bvec, gdesc, y, ymask in val_loader:
                         x, ei, ea, bvec, gdesc, y, ymask = x.to(device), ei.to(device), ea.to(device), bvec.to(device), gdesc.to(device), y.to(device), ymask.to(device)
                         with torch.autocast('cuda', enabled=use_amp, dtype=AMP_DTYPE):
-                            pred = model(x, ei, ea, bvec, gdesc)
+                            out = model(x, ei, ea, bvec, gdesc)
+                            pred = out[0] if isinstance(out, tuple) else out
                             vloss_swa, _ = masked_wmae(pred, y, ymask, ranges, weights)
                         vtot_swa += vloss_swa.item(); vb_swa += 1
                     val_dot_swa = vtot_swa / max(1, vb_swa)
@@ -4211,7 +5091,12 @@ def pretrain(args):
     set_seed(args.seed)
     train_df, test_df, _ = load_main_data(args.data_dir)
     supp_zip = load_supplemental(args.data_dir)
-    unl_df = build_unlabeled_dataframe(train_df, test_df, supp_zip, args)
+
+    # соберём sup_df, чтобы знать «домен»
+    external = ingest_external_sources(args)
+    sup_df   = build_supervised_dataframe(train_df, supp_zip, external)
+
+    unl_df = build_unlabeled_dataframe_smart(train_df, test_df, supp_zip, args, sup_df=sup_df)
 
     if len(unl_df) == 0:
         print("[SSL] Unlabeled set is empty after filtering. Skipping SSL.")
@@ -4327,12 +5212,29 @@ def pretrain(args):
     proj = ContrastiveHead(args.hidden)  # ← было с LayerNorm проверкой
 
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
-    enc = enc.to(device); proj = proj.to(device)
+    enc = enc.to(device)
+    proj = proj.to(device)
+
+    if (not args.no_compile) and torch.cuda.is_available() and not args.cpu:
+        try:
+            enc = torch.compile(enc, mode="reduce-overhead")
+            proj = torch.compile(proj, mode="reduce-overhead")
+            print("[SSL] torch.compile enabled for encoder+proj")
+        except Exception as e:
+            print("[SSL] compile skipped:", e)
+
+    # AMP: включено на CUDA; GradScaler нужен только для fp16 (для bf16 не нужен)
     use_amp = (torch.cuda.is_available() and not args.cpu)
-    scaler_ssl = torch.amp.GradScaler('cuda', enabled=use_amp)
+    scaler_ssl = torch.amp.GradScaler('cuda', enabled=(use_amp and (AMP_DTYPE == torch.float16)))
 
     params = list(enc.parameters()) + list(proj.parameters())
-    opt = torch.optim.AdamW(params, lr=args.pre_lr, weight_decay=1e-4)
+    # AdamW с fused-ядрами (если доступно) — меньше CPU-overhead, больше работы на GPU
+    try:
+        opt = torch.optim.AdamW(params, lr=args.pre_lr, weight_decay=1e-4,
+                                fused=(torch.cuda.is_available() and not args.cpu))
+    except TypeError:
+        # на старых версиях PyTorch параметра fused может не быть
+        opt = torch.optim.AdamW(params, lr=args.pre_lr, weight_decay=1e-4)
 
     # === Stage-aware cosine LR с тёплым стартом на каждую стадию SSL ===
 
@@ -4379,6 +5281,11 @@ def pretrain(args):
 
     ssl_periodic = []
 
+    # === SSL early stop по train loss: только если НЕТ batch-growth ===
+    use_ssl_early_stop = (controller_ssl is None) and (getattr(args, "ssl_early_stop", 0) > 0)
+    best_ssl_loss = float("inf")
+    ssl_no_improve = 0
+
     for ep in range(1, args.pretrain_epochs + 1):
         try:
             t0 = time.time()
@@ -4402,7 +5309,12 @@ def pretrain(args):
             for batch in iterator:
                 it += 1
                 x, ei, ea, bvec, gdesc = batch
-                x, ei, ea, bvec, gdesc = x.to(device), ei.to(device), ea.to(device), bvec.to(device), gdesc.to(device)
+
+                x = x.to(device, non_blocking=True)
+                ei = ei.to(device, non_blocking=True)
+                ea = ea.to(device, non_blocking=True)
+                bvec = bvec.to(device, non_blocking=True)
+                gdesc = gdesc.to(device, non_blocking=True)
 
                 # supercell перед view-аугациями
                 if args.aug_supercell_p > 0:
@@ -4428,19 +5340,34 @@ def pretrain(args):
                     p1, p2 = proj(z1), proj(z2)
                     loss = info_nce_loss(p1, p2, temperature=args.nce_temp)
 
-                opt.zero_grad(set_to_none=True)
-                scaler_ssl.scale(loss).backward()
-                scaler_ssl.unscale_(opt)
-                gn = torch.nn.utils.clip_grad_norm_(params, 1.0)  # можно 1.0–2.0
+                accum = max(1, int(getattr(args, "pre_accum_steps", 1)))
 
-                if torch.isfinite(gn):
-                    scaler_ssl.step(opt)  # делаем шаг
+                # нормируем лосс под аккумуляцию и делаем backward
+                if scaler_ssl.is_enabled():
+                    scaler_ssl.scale(loss / accum).backward()
                 else:
-                    print(f"[SSL][WARN] Non-finite grad_norm={gn} at epoch {ep} iter {it}. Skip step.")
-                    opt.zero_grad(set_to_none=True)  # на всякий случай, чтобы не тащить NaN-град
+                    (loss / accum).backward()
 
-                scaler_ssl.update()  # ОБЯЗАТЕЛЬНО ОДИН РАЗ за итерацию — даже если шаг пропущен
-                sched.step()  # двигаем шедулер тоже каждый шаг цикла
+                # шаг делаем только раз в 'accum' микрошагов
+                if it % accum == 0:
+                    # gradient clipping после unscale (если fp16) либо сразу (если bf16)
+                    if scaler_ssl.is_enabled():
+                        scaler_ssl.unscale_(opt)
+                    gn = torch.nn.utils.clip_grad_norm_(params, 1.0)
+
+                    if torch.isfinite(gn):
+                        if scaler_ssl.is_enabled():
+                            scaler_ssl.step(opt)
+                            scaler_ssl.update()
+                        else:
+                            opt.step()
+                    else:
+                        print(f"[SSL][WARN] Non-finite grad_norm={gn} at epoch {ep} iter {it}. Skip step.")
+
+                    opt.zero_grad(set_to_none=True)
+
+                    # Шедулер двигаем ТОЛЬКО когда был фактический шаг оптимизатора
+                    sched.step()
 
                 if args.lr_debug_steps > 0 and sched.last_epoch <= args.lr_debug_steps:
                     print(f"[SSL][LRDBG] stage={controller_ssl.stage_idx if stages_ssl else 0} "
@@ -4454,7 +5381,9 @@ def pretrain(args):
                 # периодический лог
                 if (it % args.log_every == 0) or (it == 1) or (it == batches):
                     elapsed = time.time() - step0
-                    ips = (it * max(1, args.pre_batch_size)) / max(1e-9, elapsed)  # graphs/s (приблизительно)
+                    eff_bs = max(1, args.pre_batch_size) * max(1, accum)
+                    ips = (it * eff_bs) / max(1e-9, elapsed)
+
                     remaining = max(0, batches - it)
                     eta_s = (remaining * max(1, args.pre_batch_size)) / max(ips, 1e-9)
 
@@ -4528,6 +5457,22 @@ def pretrain(args):
                 except Exception:
                     pass
 
+        # === SSL EARLY STOP: только если НЕ используется ssl_batch_growth ===
+        if use_ssl_early_stop:
+            epoch_loss = tot / max(1, nb)
+            # улучшение считается, если упало хотя бы на min_delta
+            if (best_ssl_loss - epoch_loss) >= float(getattr(args, "ssl_early_min_delta", 1e-4)):
+                best_ssl_loss = epoch_loss
+                ssl_no_improve = 0
+            else:
+                ssl_no_improve += 1
+                print(f"[SSL][EARLY-STOP] no-improve={ssl_no_improve}/{args.ssl_early_stop} "
+                      f"(best={best_ssl_loss:.6f} | cur={epoch_loss:.6f})")
+                if ssl_no_improve >= int(args.ssl_early_stop):
+                    print(f"[SSL][EARLY-STOP] stop at epoch {ep} "
+                          f"(best loss {best_ssl_loss:.6f}, patience={args.ssl_early_stop})")
+                    break
+
     # save encoder weights for fine-tuning
     torch.save(ssl_encoder_state_dict(enc), os.path.join(args.out_dir, "ssl_encoder.pt"))
 
@@ -4568,26 +5513,35 @@ def run_inference_with_tag(args, run_tag: str) -> str:
 
     modes = get_poly_modes(args)
     eval_mode = canonical_poly_mode(args, modes)
-    print(f"[INFER] poly_edge_mode={eval_mode}")
+    use_avg = (args.poly_edge_eval_mode or "first").strip().lower() == "avg"
+    eval_modes = modes if use_avg else [eval_mode]
+    print(f"[INFER] poly_edge_mode={'avg(' + ','.join(eval_modes) + ')' if use_avg else eval_mode}")
 
 
     # фикс: генератор для детерминированной раздачи батчей
     g = torch.Generator()
     g.manual_seed(args.seed)
 
-    # load test
-    test_df = pd.read_csv(os.path.join(args.data_dir, "test.csv"))
-    test_ds = PolymerDataset(test_df, TARGETS, poly_edge_mode=eval_mode)
+    # # load test
+    # test_df = pd.read_csv(os.path.join(args.data_dir, "test.csv"))
+    # test_ds = PolymerDataset(test_df, TARGETS, poly_edge_mode=eval_mode)
+    #
+    # test_loader = DataLoader(
+    #     test_ds,
+    #     batch_size=args.train_batch_size,
+    #     shuffle=False,
+    #     collate_fn=collate,
+    #     generator=g,
+    #     worker_init_fn=seed_worker,
+    #     **make_loader_kwargs(args.train_num_workers)
+    # )
 
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=args.train_batch_size,
-        shuffle=False,
-        collate_fn=collate,
-        generator=g,
-        worker_init_fn=seed_worker,
-        **make_loader_kwargs(args.train_num_workers)
-    )
+    # load test once
+    test_df = pd.read_csv(os.path.join(args.data_dir, "test.csv"))
+
+    print(f"[INFER] test_df rows: {len(test_df)}")
+    if len(test_df) == 0:
+        print("[INFER][WARN] test.csv пуст → сабмит будет без строк.")
 
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     use_amp = (torch.cuda.is_available() and not args.cpu)
@@ -4615,23 +5569,151 @@ def run_inference_with_tag(args, run_tag: str) -> str:
     model.load_state_dict(sd)
     model.eval()
 
-    preds = []
+    # preds = []
+    # with torch.no_grad():
+    #     for x, ei, ea, bvec, gdesc, y, ymask in test_loader:
+    #         x, ei, ea, bvec, gdesc = x.to(device), ei.to(device), ea.to(device), bvec.to(device), gdesc.to(device)
+    #         with torch.autocast('cuda', enabled=use_amp, dtype=AMP_DTYPE):
+    #             o = model(x, ei, ea, bvec, gdesc).detach().to(torch.float32).cpu().numpy()
+    #
+    #
+    #         preds.append(o)
+    # preds = np.vstack(preds)
+
+    def _make_loader(ds):
+        return DataLoader(
+            ds, batch_size=args.train_batch_size, shuffle=False, collate_fn=collate,
+            generator=g, worker_init_fn=seed_worker, **make_loader_kwargs(args.train_num_workers)
+        )
+
+    preds_sum = None
     with torch.no_grad():
-        for x, ei, ea, bvec, gdesc, y, ymask in test_loader:
-            x, ei, ea, bvec, gdesc = x.to(device), ei.to(device), ea.to(device), bvec.to(device), gdesc.to(device)
-            with torch.autocast('cuda', enabled=use_amp, dtype=AMP_DTYPE):
-                o = model(x, ei, ea, bvec, gdesc).detach().to(torch.float32).cpu().numpy()
+        for m_eval in eval_modes:
+            test_ds = PolymerDataset(test_df, TARGETS, poly_edge_mode=m_eval)
+            test_loader = _make_loader(test_ds)
 
+            # прогресс-бар без лишних хелперов
+            if not getattr(args, "no_tqdm", False):
+                test_loader = tqdm(test_loader, total=len(test_loader), desc=f"[INFER] {m_eval}")
 
-            preds.append(o)
-    preds = np.vstack(preds)
+            # TTA: N прогонов с активным Dropout
+            tta_reps = max(1, int(getattr(args, "tta", 0)) or 1)
+            mode_sum = None
+            for rep in range(tta_reps):
+                model.eval()
+                _enable_mc_dropout(model, enable=(tta_reps > 1))
+                cur = []
+                for x, ei, ea, bvec, gdesc, y, ymask in test_loader:
+                    x, ei, ea, bvec, gdesc = x.to(device), ei.to(device), ea.to(device), bvec.to(device), gdesc.to(
+                        device)
+                    with torch.autocast('cuda', enabled=use_amp, dtype=AMP_DTYPE):
+                        out = model(x, ei, ea, bvec, gdesc)
+                    cur.append(out.detach().to(torch.float32).cpu().numpy())
+                cur = np.vstack(cur)
+                mode_sum = cur if mode_sum is None else (mode_sum + cur)
+            preds_mode = mode_sum / float(tta_reps)
+            preds_sum = preds_mode if preds_sum is None else (preds_sum + preds_mode)
+    preds = preds_sum / float(len(eval_modes))
+    print(f"[INFER] preds shape: {preds.shape}  (rows must equal len(test_df)={len(test_df)})")
+
+    # ===== Изотоническая калибровка (если есть и запросили) =====
+    iso_path = os.path.join(args.out_dir, f"isotonic_{run_tag}.json")
+    if getattr(args, "apply_isotonic", False) and os.path.exists(iso_path):
+        with open(iso_path, "r") as f:
+            iso = json.load(f).get("maps", {})
+        for i, t in enumerate(TARGETS):
+            m = iso.get(t)
+            if m and m.get("x") and m.get("y"):
+                preds[:, i] = _iso_apply_1d(preds[:, i].astype(np.float64),
+                                            np.asarray(m["x"], float), np.asarray(m["y"], float))
+        print("[INFER] isotonic calibration applied")
+    else:
+        if getattr(args, "apply_isotonic", False):
+            print(f"[INFER] isotonic maps not found for tag {run_tag} → skip")
+
+    # ===== Пост-обработка: winsorize и range-match по вал-статистике =====
+    stats_path = os.path.join(args.out_dir, f"calib_stats_{run_tag}.json")
+    if os.path.exists(stats_path):
+        with open(stats_path, "r") as f:
+            cinfo = json.load(f)
+        st = cinfo.get("stats", {})
+        # 1) winsorize
+        if getattr(args, "apply_winsor", False):
+            for i, t in enumerate(TARGETS):
+                s = st.get(t, {})
+                ql, qh = s.get("q_low"), s.get("q_high")
+                if ql is not None:
+                    preds[:, i] = np.maximum(preds[:, i], ql)
+                if qh is not None:
+                    preds[:, i] = np.minimum(preds[:, i], qh)
+            print("[INFER] winsorize applied from validation percentiles")
+        # 2) range-match (аффинное преобразование min/max тест-предсказаний к вал-диапазону)
+        if getattr(args, "range_match", False):
+            for i, t in enumerate(TARGETS):
+                s = st.get(t, {})
+                vmin, vmax = s.get("min"), s.get("max")
+                if vmin is None or vmax is None or vmax <= vmin:
+                    continue
+                pmin, pmax = float(preds[:, i].min()), float(preds[:, i].max())
+                if pmax <= pmin:
+                    continue
+                scale = (vmax - vmin) / (pmax - pmin)
+                preds[:, i] = (preds[:, i] - pmin) * scale + vmin
+            print("[INFER] range-match applied to align test range to validation range")
+    else:
+        print(f"[INFER] calib stats not found: {stats_path} (skip post-processing)")
+
+    # ====== kNN-blend на SSL-эмбеддинге (опционально) ======
+    alpha = float(getattr(args, "knn_alpha", 0.0) or 0.0)
+    if alpha > 0.0:
+        print(f"[INFER] kNN-blend enabled: alpha={alpha}, k={args.knn_k}, tau={args.knn_tau}")
+
+        # соберём supervised DF так же, как в трене
+        tr_df, te_df, _ = load_main_data(args.data_dir)
+        supp_zip = load_supplemental(args.data_dir)
+        external = ingest_external_sources(args)
+        sup_df = build_supervised_dataframe(tr_df, supp_zip, external)
+
+        # только примеры с хотя бы 1 лейблом
+        sup_df = sup_df[~sup_df[TARGETS].isna().all(axis=1)].reset_index(drop=True)
+        print(f"[KNN] labeled sup_df: {len(sup_df)} rows")
+
+        train_ds = PolymerDataset(sup_df, TARGETS, poly_edge_mode=eval_modes[0])
+        train_loader = DataLoader(train_ds, batch_size=args.train_batch_size, shuffle=False,
+                                  collate_fn=collate, generator=g, worker_init_fn=seed_worker,
+                                  **make_loader_kwargs(args.train_num_workers))
+
+        # подготовим test_loader, чтобы видеть прогресс кодирования
+        test_ds = PolymerDataset(test_df, TARGETS, poly_edge_mode=eval_modes[0])
+        test_loader = _make_loader(test_ds)
+
+        # оборачиваем оба лоадера в tqdm, если пользователь не отключил бары
+        enc_test_loader = test_loader
+        enc_train_loader = train_loader
+        if not getattr(args, "no_tqdm", False):
+            enc_test_loader = tqdm(test_loader, total=len(test_loader), desc="[ENC] test")
+            enc_train_loader = tqdm(train_loader, total=len(train_loader), desc="[ENC] train")
+
+        # эмбеддинги (ничего в _encode_dataset не трогаем)
+        G_test, _, _ = _encode_dataset(model, enc_test_loader, device, use_amp)
+        G_train, Y_train, M_train = _encode_dataset(model, enc_train_loader, device, use_amp)
+        print(f"[ENC] G_test={G_test.shape} | G_train={G_train.shape}")
+
+        Y_knn = _knn_regress(
+            G_test, G_train, Y_train.astype(np.float32), M_train.astype(bool),
+            k=int(getattr(args, "knn_k", 32)), tau=float(getattr(args, "knn_tau", 0.2))
+        )
+        print(f"[KNN] Y_knn shape: {Y_knn.shape}")
+        preds = (1.0 - alpha) * preds + alpha * Y_knn
+        print(f"[KNN] blended preds shape: {preds.shape}")
+
     out_csv = os.path.join(args.out_dir, f"submission_{run_tag}.csv")
 
     sub = pd.DataFrame({"id": test_df["id"].values})
     for i, t in enumerate(TARGETS):
         sub[t] = preds[:,i]
     sub.to_csv(out_csv, index=False)
-    print(f"[INFER] predictions saved → {out_csv}")
+    print(f"[INFER] predictions saved → {out_csv} | rows={len(sub)}")
 
     return out_csv
 
@@ -4704,7 +5786,7 @@ def parse_args():
                       default="C:/Users/pasha/My_SMARTS_fragmentation/NeurIPS_polymer/GPT5/external_dir",
                       help="Внешние датасеты (PI1M.csv, Tg/Tc/Density и др.) — папка или zip-структуры")
     g_io.add_argument("--out_dir", type=str,
-                      default="C:/Users/pasha/My_SMARTS_fragmentation/NeurIPS_polymer/GPT5/polymer_gnn_pro_ssl_train_test_42",
+                      default="C:/Users/pasha/My_SMARTS_fragmentation/NeurIPS_polymer/GPT5/polymer_gnn_pro_ssl_train_test_50",
                       help="Куда сохранять логи/веса/сабмиты и т.п.")
 
     # ---- Modes (что запускать) ---------------------------------------------
@@ -4878,7 +5960,7 @@ def parse_args():
     g_sup.add_argument("--poly_edge_modes", type=str, default="cycle,pair",
                        help="Список режимов poly_edge_mode через запятую (напр., 'cycle,pair'). Если пусто — используется --poly_edge_mode.")
     g_sup.add_argument("--poly_edge_eval_mode", type=str, default="first",
-                       help="Какой режим использовать на валидации/инференсе: 'first' (первый из --poly_edge_modes) или явное значение ('cycle'|'pair'|'clique').")
+                       help="Какой режим использовать на валидации/инференсе: 'first' (первый из --poly_edge_modes) или явное значение ('cycle'|'pair'|'clique|avg').")
 
     g_ssl.add_argument("--aug_supercell_p", type=float, default=0.0,
                        help="Вероятность применить 2D суперячейку (0 — выкл.)")
@@ -4891,6 +5973,118 @@ def parse_args():
                        help="Вероятность сделать локальную замену Me/Et, F/Cl, OMe/OEt вне бэкбона")
     g_ssl.add_argument("--aug_local_dynamic", action="store_true",
                        help="Делать замены на лету в UnlabeledDS (иначе только при материализации)")
+
+    # --- SSL early stop (по train loss) ---
+    g_ssl.add_argument("--ssl_early_stop", type=int, default=5,
+                       help="Ранняя остановка в SSL по train loss (кол-во эпох без улучшений). 0 = выключено.")
+    g_ssl.add_argument("--ssl_early_min_delta", type=float, default=1e-4,
+                       help="Минимальное улучшение train loss между эпохами для SSL-ранней остановки.")
+
+    # ---- SSL unlabeled selection ------------------------------------------------
+    g_ssl.add_argument("--unl_use_sup_df", action="store_true",
+                       help="Включать ВСЕ SMILES из sup_df в пул SSL (без лейблов). Рекомендуется.")
+    g_ssl.add_argument("--unl_use_main_test", action="store_true", default=True,
+                       help="Включать SMILES из main_test в пул SSL. По умолчанию включено.")
+    g_ssl.add_argument("--unl_near_frac", type=float, default=0.6,
+                       help="Доля 'near-domain' молекул в итоговом unlabeled (scaffold совпадает с sup_df и/или высокий Tanimoto).")
+    g_ssl.add_argument("--unl_far_frac", type=float, default=0.2,
+                       help="Доля 'far-domain' молекул с низким Tanimoto для разнообразия.")
+    g_ssl.add_argument("--unl_max_ref", type=int, default=5000,
+                       help="Сколько референсных sup_df молекул использовать для оценки max-Tanimoto (для скорости).")
+    g_ssl.add_argument("--unl_far_tanimoto_max", type=float, default=0.25,
+                       help="Порог max-Tanimoto для 'far-domain'.")
+    g_ssl.add_argument("--unl_near_tanimoto_min", type=float, default=0.5,
+                       help="Порог max-Tanimoto для near-кандидатов")
+    g_ssl.add_argument("--unl_scaffold_cap", type=int, default=200,
+                       help="Мягкий лимит выборок на один scaffold при отборе (баланс разнообразия). 0 = без лимита.")
+    g_ssl.add_argument("--unl_dedup_key", type=str, choices=["canon", "smiles", "inchi"], default="canon",
+                       help="Ключ для дедупликации unlabeled: канонический SMILES после нормализации ('canon'), исходный ('smiles') или InChIKey ('inchi').")
+    g_ssl.add_argument("--unl_pi1m_cap", type=int, default=300000,
+                       help="Сколько строк из PI1M.csv максимум брать в пул до тяжёлых операций (scaffold/FP). 0 = всё.")
+    g_ssl.add_argument("--unl_n_jobs", type=int, default=0,
+                       help="Параллель при расчёте Tanimoto (0=выкл, -1=все ядра, >0=число процессов)")
+
+
+    g_ssl.add_argument("--pre_accum_steps", type=int, default=1,
+                       help="Градиентная аккумуляция: сколько микробатчей по pre_batch_size сливать перед optimizer.step(). 1 = выкл.")
+
+    # ---- Inference ----------------------------------------------------------
+    g_inf = p.add_argument_group("Inference")
+    g_inf.add_argument("--tta", type=int, default=0, help="MC-Dropout TTA: число прогонов на инференсе (0 — выкл.)")
+    g_inf.add_argument("--knn_alpha", type=float, default=0.0, help="Доля kNN-бленда (0 — выкл.)")
+    g_inf.add_argument("--knn_k", type=int, default=32, help="Число соседей в kNN")
+    g_inf.add_argument("--knn_tau", type=float, default=0.2, help="Температура в softmax весах kNN")
+
+    g_sup.add_argument("--hetero_sigma_head", action="store_true",
+                       help = "Добавить вторую голову sigma для гетероскедастической регрессии (per-sample σ)")
+
+    g_sup.add_argument("--balanced_sampler", action="store_true",
+                       help="Взвешенный семплинг батчей по наличию редких таргетов")
+    g_sup.add_argument("--sampler_strength", type=float, default=1.0,
+                       help="Сила бонуса для объектов с редкими таргетами")
+    g_sup.add_argument("--sampler_beta", type=float, default=0.5,
+                       help="Степень в (1/freq)^beta при расчёте бонуса")
+
+    g_sup.add_argument("--constrain_head", action="store_true",
+                       help = "Включить физически осмысленные ограничения в голове: FFV∈[0,1], Rg>0, Density>0")
+
+    g_sup.add_argument("--winsor_q_low", type=float, default=0.0,
+                       help="Нижний перцентиль предсказаний на валидации для winsorize (0=выкл.)")
+    g_sup.add_argument("--winsor_q_high", type=float, default=100.0,
+                       help="Верхний перцентиль предсказаний на валидации для winsorize (100=выкл.)")
+    g_sup.add_argument("--save_val_range_stats", action="store_true",
+                       help="Сохранять статистики предсказаний на валидации (перцентили и min/max) для пост-обработки")
+
+    g_inf.add_argument("--apply_winsor", action="store_true",
+                       help="Применить winsorize к тест-предсказаниям по сохранённым вал-перцентилям")
+    g_inf.add_argument("--range_match", action="store_true",
+                       help="Аффинно привести диапазон тест-предсказаний к валидационному (по сохранённым min/max)")
+
+    g_sup.add_argument("--fit_isotonic", action="store_true",
+                       help="Фит изотонической калибровки на вал-предсказаниях и сохранение узлов")
+    g_inf.add_argument("--apply_isotonic", action="store_true",
+                       help="Применить изотоническую калибровку (если сохранена для этого run_tag)")
+
+    g_sup.add_argument("--per_target_last", action="store_true",
+                       help="Сделать выход головы per-target (отдельный Linear на каждый таргет)")
+    g_sup.add_argument("--head_lr", type=float, default=None,
+                       help="LR для головы (если None — как --lr)")
+    g_sup.add_argument("--head_weight_decay", type=float, default=None,
+                       help="WD для головы (если None — как --weight_decay)")
+    g_sup.add_argument("--head_lr_mults", type=str, default="1,1,1,1,1",
+                       help="Мультипликаторы LR для последнего слоя головы по таргетам (используется при --per_target_last)")
+    g_sup.add_argument("--sigma_head_lr", type=float, default=None,
+                       help="LR для sigma-головы (если None — как head_lr)")
+
+    # Раздельный warmup/косина для разных групп параметров
+    g_sup.add_argument("--bb_warmup_frac", type=float, default=None,
+                       help="Доля шагов warmup для бэкбона (если None — как --warmup_frac)")
+    g_sup.add_argument("--bb_warmup_steps", type=int, default=0,
+                       help="Жёсткий оверрайд шагов warmup для бэкбона (0 — выкл.)")
+    g_sup.add_argument("--bb_cosine_floor", type=float, default=0.0,
+                       help="Пол косинусного расписания для бэкбона (0..1)")
+
+    g_sup.add_argument("--head_warmup_frac", type=float, default=None,
+                       help="Доля шагов warmup для головы (если None — как --warmup_frac)")
+    g_sup.add_argument("--head_warmup_steps", type=int, default=0,
+                       help="Жёсткий оверрайд шагов warmup для головы (0 — выкл.)")
+    g_sup.add_argument("--head_cosine_floor", type=float, default=0.0,
+                       help="Пол косинусного расписания для головы (0..1)")
+
+    g_sup.add_argument("--auto_head_lr_mults", action="store_true",
+                       help="Авто-подбор LR-мультипликаторов per-target по градиентным нормам (требует --per_target_last)")
+    g_sup.add_argument("--auto_lr_window", type=int, default=200,
+                       help="Окно усреднения градиентных норм в шагах")
+    g_sup.add_argument("--auto_lr_every", type=int, default=100,
+                       help="Как часто обновлять множители (в шагах)")
+    g_sup.add_argument("--auto_lr_gamma", type=float, default=0.5,
+                       help="Степень в (median/gnorm)^gamma")
+    g_sup.add_argument("--auto_lr_min_mult", type=float, default=0.5,
+                       help="Нижняя граница множителя")
+    g_sup.add_argument("--auto_lr_max_mult", type=float, default=2.0,
+                       help="Верхняя граница множителя")
+    g_sup.add_argument("--auto_lr_start_after_warmup", action="store_true",
+                       help="Стартовать авто-подбор только после warmup-фазы текущей стадии")
 
     # ----- parse & postprocess ----------------------------------------------
     args = p.parse_args()
