@@ -28,7 +28,7 @@ except Exception:
 
 import signal, platform
 from datetime import datetime
-from torch.nn import functional as F
+import torch.nn.functional as F
 
 from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
@@ -48,7 +48,6 @@ except AttributeError:
 import gc, torch
 import hashlib  # для хеш-бакинга n-грамм
 
-import torch.nn.functional as F
 
 import platform
 from rdkit import DataStructs
